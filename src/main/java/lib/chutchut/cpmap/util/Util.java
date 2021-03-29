@@ -237,7 +237,7 @@ public class Util {
 
     public static String getInstalledPkgVersion(Context context, String pkg) {
         try {
-            PackageInfo packageInfo = context.getPackageManager().getPackageInfo(pkg, 0);
+            PackageInfo packageInfo = Util.getPackageInfo(context, pkg);
             if (packageInfo != null) {
                 if (packageInfo.versionName != null) {
                     return packageInfo.versionName;
@@ -247,7 +247,7 @@ public class Util {
             } else {
                 return null;
             }
-        } catch (PackageManager.NameNotFoundException nnfe) {
+        } catch (Exception e) {
             return null;
         }
     }
@@ -314,11 +314,15 @@ public class Util {
         return null;
     }
 
-    public static String getAuthorityFromVector(CPVector vector) {
-        String auth = vector.getUri().getAuthority();
+    public static String getAuthorityFromUri(Uri uri) {
+        String auth = uri.getAuthority();
         // Split on slash and return the first segment (because segments can be part of the authority?
         String[] authSplit = auth.split("/");
         return authSplit[0].replace(CPVector.injectionChar, "");
+    }
+
+    public static String getAuthorityFromVector(CPVector vector) {
+        return getAuthorityFromUri(vector.getUri());
     }
 
     public static boolean pkgVersionisInstalled(Context context, String pkg, String version) {
@@ -583,8 +587,7 @@ public class Util {
                 }
             }
         }
-        // Undefined
-        return "n/a";
+        return null;
     }
 
     public static String[] getRowsAsStringArr(ArrayList<String[]> rows) {
@@ -675,7 +678,10 @@ public class Util {
 
     public static int getPmFlags() {
         return PackageManager.GET_META_DATA
+                |PackageManager.GET_ACTIVITIES
                 |PackageManager.GET_PROVIDERS
+                |PackageManager.GET_RECEIVERS
+                |PackageManager.GET_SERVICES
                 |PackageManager.GET_RESOLVED_FILTER
                 |PackageManager.GET_INTENT_FILTERS
                 |PackageManager.GET_PERMISSIONS
@@ -712,6 +718,8 @@ public class Util {
                     return true;
                 }
             }
+        } else if (pInfo.grantUriPermissions || (pInfo.uriPermissionPatterns != null && pInfo.uriPermissionPatterns.length > 0)) {
+            return true;
         }
         return false;
     }
@@ -720,12 +728,12 @@ public class Util {
         ArrayList<ProviderInfo> providers = new ArrayList<>();
         PackageInfo pkgInfo;
         try {
-            pkgInfo = context.getPackageManager().getPackageInfo(pkg, getPmFlags());
-        } catch (PackageManager.NameNotFoundException nnfe) {
-            Log.w(TAG, "NameNotFoundException for requested package: " + pkg);
+            pkgInfo = Util.getPackageInfo(context, pkg);
+        } catch (Exception e) {
+            Log.w(TAG, "Exception for requested package: " + pkg);
             return null;
         }
-        if (!Util.nullOrEmpty(pkgInfo.providers)) {
+        if (pkgInfo != null && !Util.nullOrEmpty(pkgInfo.providers)) {
             for (ProviderInfo pInfo : pkgInfo.providers) {
                 // Skip/filter based on options
                 if ((onlyProv != null && !onlyProv.contains(pInfo.name)) || (skipProv != null && skipProv.contains(pInfo.name))) {

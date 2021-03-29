@@ -24,6 +24,7 @@ public abstract class Payload {
 
     private transient Map<String, String> templatePlaceholderMap;
     private static transient String templatePlaceholderPattern = "(\\[([A-Z]+)\\])";
+    private transient String renderedPayload;
 
     protected String name;
     protected String template;
@@ -206,7 +207,6 @@ public abstract class Payload {
         if (template == null || template.trim().length() == 0) {
             throw new RuntimeException("Payload template not set");
         }
-        // (*Always!*) Call interface methods to set placeholder vars
         callInterface();
         // Check for unmapped placeholder vars and raise an exception if any found
         ArrayList<String> unmapped = getUnmappedPlaceholderKeys();
@@ -238,7 +238,10 @@ public abstract class Payload {
     }
 
     public String getPayload() {
-        return renderTemplate();
+        if (renderedPayload == null) {
+            renderedPayload = renderTemplate();
+        }
+        return renderedPayload;
     }
 
     @Override

@@ -18,6 +18,8 @@ public class BooleanBlindPayload extends InjectionPayload implements Payload.IPa
     public static final String NAME = "BOOLEAN";
     public static final int TYPE = 334;
 
+    public static final int DEFAULT_BRACKET_LIMIT = 2;
+
     protected boolean boolState;
     protected String customBody;
 
@@ -31,7 +33,7 @@ public class BooleanBlindPayload extends InjectionPayload implements Payload.IPa
 
         public static Set<BooleanBlindPayload> getDefault() {
             String customCaseBody = "CASE WHEN ([ICOND]) THEN zeroblob(999) ELSE zeroblob(99999999999999) END";
-            return get(new String[] {InjectionPayload.defaultField, "[ICOND]"}, 2, new char[] {0, '\'', '"'}, new String[] {"AND", "OR"}, new boolean[] {true}, new String[] {null, customCaseBody});
+            return get(new String[] {InjectionPayload.defaultField, "[ICOND]"}, DEFAULT_BRACKET_LIMIT, new char[] {0, '\'', '"'}, new String[] {"AND", "OR"}, new boolean[] {true}, new String[] {null, customCaseBody});
         }
 
         public static Set<BooleanBlindPayload> get(String[] fields, int brNum, char[] quotes, String[] ops, boolean[] states, String[] bodys) {

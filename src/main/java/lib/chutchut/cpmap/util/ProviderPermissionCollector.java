@@ -176,12 +176,12 @@ public class ProviderPermissionCollector {
 
     private List<String> getPackageManifestPermissions() {
         try {
-            PackageInfo pkgInfo = context.getPackageManager().getPackageInfo(context.getPackageName(), PackageManager.GET_PERMISSIONS);
-            if (!Util.nullOrEmpty(pkgInfo.requestedPermissions)) {
+            PackageInfo pkgInfo = Util.getPackageInfo(context, context.getPackageName());
+            if (pkgInfo != null && !Util.nullOrEmpty(pkgInfo.requestedPermissions)) {
                 return Arrays.asList(pkgInfo.requestedPermissions);
             }
-        } catch (PackageManager.NameNotFoundException nnfe) {
-            Log.e("PermissionCollector", String.format("Exception collecting missing provider permissions from target package (%s): %s", targetPkg, nnfe.getMessage()));
+        } catch (Exception e) {
+            Log.e("PermissionCollector", String.format("Exception collecting missing provider permissions from target package (%s): %s", targetPkg, e.getMessage()));
         }
         return new ArrayList<>();
     }
@@ -190,13 +190,15 @@ public class ProviderPermissionCollector {
         HashSet<String> pkgs = new HashSet<>();
         HashSet<PackageInfo> pkginfos = new HashSet<>();
         if (targetPkg == null) {
-            pkginfos.addAll(context.getPackageManager().getInstalledPackages(PackageManager.GET_PROVIDERS | PackageManager.GET_PERMISSIONS));
+            pkginfos.addAll(context.getPackageManager().getInstalledPackages(Util.getPmFlags()));
         } else {
             try {
-                PackageInfo pkgInfo = context.getPackageManager().getPackageInfo(targetPkg, PackageManager.GET_PROVIDERS | PackageManager.GET_PERMISSIONS);
-                pkginfos.add(pkgInfo);
-            } catch (PackageManager.NameNotFoundException nnfe) {
-                Log.e("ProvPermCollector", "NameNotFoundException: " + nnfe.getMessage());
+                PackageInfo pkgInfo = Util.getPackageInfo(context, targetPkg);
+                if (pkgInfo != null) {
+                    pkginfos.add(pkgInfo);
+                }
+            } catch (Exception e) {
+                Log.e("ProvPermCollector", "Exception: " + e.getMessage());
                 return null;
             }
         }

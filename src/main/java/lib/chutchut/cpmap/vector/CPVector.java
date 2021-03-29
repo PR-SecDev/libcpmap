@@ -7,6 +7,7 @@ package lib.chutchut.cpmap.vector;
 import android.content.ContentValues;
 import android.content.pm.ProviderInfo;
 import android.net.Uri;
+import android.os.Bundle;
 
 import java.util.ArrayList;
 import java.util.HashMap;
@@ -43,7 +44,6 @@ public class CPVector {
     private int vectorType = UNKNOWN;
     public static final String injectionChar = "*";
 
-    private String contentUri;
     private String originalUri;
     private String[] projection;
     private String[] selectionArgs;
@@ -52,12 +52,7 @@ public class CPVector {
     private HashMap<String, String> valuesMap;
     private HashMap<String, String> qParams;
 
-    private String query;
-    private String providerClass;
-    private String requiredPermission;
-    private String requiredPathPermission;
-    private HashSet<String> readQueryFields = new HashSet<>();
-    private HashSet<String> updateQueryFields = new HashSet<>();
+    private Bundle vectorConfig = new Bundle();
 
     public static int[] readVectorTypes = new int[] {
             CPVector.URI_ID,
@@ -83,16 +78,95 @@ public class CPVector {
      */
     private CPVector() {}
 
-    public CPVector(String uri, String[] projection, String[] selection, String sort, String where, ContentValues vals, HashMap<String, String> qParams) {
+    public CPVector(String uri, String[] projection, String[] selection, String sort, String where, ContentValues vals, HashMap<String, String> qParams, ProviderInfo providerInfo) {
         this.originalUri = uri;
         this.projection = projection;
         this.selectionArgs = selection;
         this.sortOrder = sort;
         this.where = where;
-        this.valuesMap = valsToMap(vals);
+        this.valuesMap = (vals != null) ? valsToMap(vals) : null;
         this.qParams = qParams;
         setUri(Uri.parse(uri));
         parse();
+        if (providerInfo != null) {
+            setProviderProperties(providerInfo);
+        }
+    }
+
+    public CPVector(String uri, String[] projection, String[] selection, String sort, String where, ContentValues vals, HashMap<String, String> qParams, Bundle vectorConfig) {
+        this.originalUri = uri;
+        this.projection = projection;
+        this.selectionArgs = selection;
+        this.sortOrder = sort;
+        this.where = where;
+        this.valuesMap = (vals != null) ? valsToMap(vals) : null;
+        this.qParams = qParams;
+        this.vectorConfig = vectorConfig;
+        setUri(Uri.parse(uri));
+        parse();
+    }
+
+    private Object get(String key) {
+        return (vectorConfig.containsKey(key)) ? vectorConfig.get(key) : null;
+    }
+
+    public void setContentUri(String contentUri) {
+        vectorConfig.putString("content_uri", contentUri);
+    }
+
+    public String getContentUri() {
+        return (String) get("content_uri");
+    }
+
+    public void setQuery(String query) {
+        vectorConfig.putString("query", query);
+    }
+
+    public String getQuery() {
+        return (String) get("query");
+    }
+
+    public void setProviderClass(String pCls) {
+        vectorConfig.putString("provider_class", pCls);
+    }
+
+    public String getProviderClass() {
+        return (String) get("provider_class");
+    }
+
+    public void setProviderPermission(String rPerm) {
+        vectorConfig.putString("provider_permission", rPerm);
+    }
+
+    public String getProviderPermission() {
+        return (String) get("provider_permission");
+    }
+
+    public void setPathPermission(String rPathPerm) {
+        vectorConfig.putString("path_permission", rPathPerm);
+    }
+
+    public String getPathPermission() {
+        return (String) get("path_permission");
+    }
+
+    public void setQueryFields(Set<String> fields) {
+        if (isQuery()) {
+            vectorConfig.putStringArrayList("query_fields", new ArrayList<>(fields));
+        }
+    }
+
+    public Set<String> getFields() {
+        if (isUpdate()) {
+            return valuesMap.keySet();
+        } else {
+            Set<String> fields = new HashSet<>();
+            ArrayList<String> fieldList = (ArrayList<String>) get("query_fields");
+            if (fieldList != null) {
+                fields.addAll(fieldList);
+            }
+            return fields;
+        }
     }
 
     public CPVector copy() {
@@ -100,19 +174,7 @@ public class CPVector {
     }
 
     public CPVector copy(Uri uri) {
-        CPVector cpVector =  new CPVector(uri.toString(), projection, selectionArgs, sortOrder, where, mapToVals(), qParams);
-        copyProperties(cpVector);
-        return cpVector;
-    }
-
-    private void copyProperties(CPVector cpVector) {
-        cpVector.query = query;
-        cpVector.originalUri = originalUri;
-        cpVector.providerClass = providerClass;
-        cpVector.requiredPermission = requiredPermission;
-        cpVector.requiredPathPermission = requiredPathPermission;
-        cpVector.readQueryFields = readQueryFields;
-        cpVector.updateQueryFields = updateQueryFields;
+        return new CPVector(uri.toString(), projection, selectionArgs, sortOrder, where, mapToVals(), qParams, new Bundle(vectorConfig));
     }
 
     public Uri getUri() {
@@ -124,16 +186,16 @@ public class CPVector {
         try {
             String qStr = getQueryParamString();
             if (qStr != null && withQuery) {
-                return Uri.parse(contentUri + qStr);
+                return Uri.parse(getContentUri() + qStr);
             } else {
-                return Uri.parse(contentUri);
+                return Uri.parse(getContentUri());
             }
         } catch (Exception e) {
             return null;
         }
     }
 
-    public void setUri(Uri uri) {
+    private void setUri(Uri uri) {
         // If query params present, and not already set explicitly, strip them from the uri
         if (uri.getQuery() != null && qParams == null) {
             HashMap<String, String> paramMap = new HashMap<>();
@@ -143,10 +205,18 @@ public class CPVector {
             }
             qParams = paramMap;
         }
-        contentUri = uri.toString().contains("?") ? uri.toString().substring(0, uri.toString().indexOf("?")) : uri.toString();
+        String contentUri = uri.toString().contains("?") ? uri.toString().substring(0, uri.toString().indexOf("?")) : uri.toString();
         if (vectorType == URI_ID && !contentUri.endsWith(injectionChar)) {
             // If this is a URI vector ensure setting the URI doesnt clobber the substitution char
             contentUri += injectionChar;
+        }
+        setContentUri(contentUri);
+    }
+
+    public void updateUri(ProviderInfo providerInfo, Uri uri) {
+        setUri(uri);
+        if (providerInfo != null) {
+            setProviderProperties(providerInfo);
         }
     }
 
@@ -190,17 +260,13 @@ public class CPVector {
         vectorType = type;
     }
 
-    public String getQuery() {
-        return query;
-    }
-
     private String getVectorTableFromSql() {
         String vectorTable = null;
-        if (query != null) {
+        if (getQuery() != null) {
             Pattern tblPatternQuery = Pattern.compile("FROM\\s+([\\w-_<>]+)\\s?", Pattern.CASE_INSENSITIVE);
             Pattern tblPatternUpdate = Pattern.compile("UPDATE\\s+([\\w-_<>]+)\\sSET", Pattern.CASE_INSENSITIVE);
-            Matcher matchQuery = tblPatternQuery.matcher(query);
-            Matcher matchUpd = tblPatternUpdate.matcher(query);
+            Matcher matchQuery = tblPatternQuery.matcher(getQuery());
+            Matcher matchUpd = tblPatternUpdate.matcher(getQuery());
             if (matchQuery.find()) {
                 vectorTable = matchQuery.group(1);
             } else if (matchUpd.find()) {
@@ -235,31 +301,15 @@ public class CPVector {
         return vectorTable;
     }
 
-    public void setQuery(String qry) {
-        query = qry;
-    }
-
-    public String getProviderClass() {
-        return providerClass;
-    }
-
-    public void setProviderProperties(ProviderInfo providerInfo) {
-        providerClass = providerInfo.name;
+    private void setProviderProperties(ProviderInfo providerInfo) {
+        setProviderClass(providerInfo.name);
         if (isQuery()) {
-            requiredPermission = providerInfo.readPermission;
-            requiredPathPermission = Util.getPathPermission(providerInfo, true, getUri());
+            setProviderPermission(providerInfo.readPermission);
+            setPathPermission(Util.getPathPermission(providerInfo, true, getUri()));
         } else if (isUpdate()) {
-            requiredPermission = providerInfo.writePermission;
-            requiredPathPermission = Util.getPathPermission(providerInfo, false, getUri());
+            setProviderPermission(providerInfo.writePermission);
+            setPathPermission(Util.getPathPermission(providerInfo, false, getUri()));
         }
-    }
-
-    public String getRequiredPermission() {
-        return requiredPermission;
-    }
-
-    public String getRequiredPathPermission() {
-        return requiredPathPermission;
     }
 
     public static ContentValues getBasicContentValuesForUpdateVector() {
@@ -270,19 +320,19 @@ public class CPVector {
     }
 
     public boolean isUpdate() {
-        if (query == null) {
+        if (getQuery() == null) {
             // If query is null rely on vector type list
-            return Util.listContains(writeVectorTypes, vectorType) && updateQueryFields.size() > 0;
+            return Util.listContains(writeVectorTypes, vectorType) && valuesMap != null && valuesMap.keySet().size() > 0;
         }
-        return query.trim().toLowerCase().startsWith("update ");
+        return getQuery().trim().toLowerCase().startsWith("update ");
     }
 
     public boolean isQuery() {
-        if (query == null) {
+        if (getQuery() == null) {
             // If query is null rely on vector type list
-            return Util.listContains(readVectorTypes, vectorType) && readQueryFields.size() > 0;
+            return Util.listContains(readVectorTypes, vectorType) && (valuesMap == null || valuesMap.keySet().size() == 0);
         }
-        return query.trim().toLowerCase().startsWith("select ");
+        return getQuery().trim().toLowerCase().startsWith("select ");
     }
 
     public void addQueryParam(String key, String val) {
@@ -371,7 +421,7 @@ public class CPVector {
         QueryParser queryParser = new QueryParser(this);
         ArrayList<String> colsFromQuery = queryParser.getCols(filter);
         // Assumes there is a query to parse.. there might not be so use a fallback
-        ArrayList<String> fallback = new ArrayList<>(isQuery() ? readQueryFields : updateQueryFields);
+        ArrayList<String> fallback = new ArrayList<>(getFields());
         if (colsFromQuery.size() > 0) {
             return colsFromQuery;
         } else if (filter == null) {
@@ -387,11 +437,22 @@ public class CPVector {
         }
     }
 
-    public static ArrayList<CPVector> getVectorsFromUri(String uri) {
+    public static ArrayList<CPVector> getVectorsFromUri(ProviderInfo providerInfo, String uri) {
         Uri parsedUri = Uri.parse(uri);
+
         // If the parsed uri or path of the uri cannot be obtained, assume invalid
         if (parsedUri == null || parsedUri.getPath() == null) {
             return null;
+        }
+
+        // If the uri contains a placeholder segment (/*/) strip it
+        if (parsedUri.toString().contains("/" + injectionChar + "/")) {
+            parsedUri = Uri.parse(parsedUri.toString().replace("/" + injectionChar + "/", "/"));
+        }
+
+        // If the uri path ends in a placeholder strip it
+        if (parsedUri.getPath().trim().endsWith(injectionChar)) {
+            parsedUri = Uri.parse(parsedUri.toString().replace(injectionChar, ""));
         }
 
         ArrayList<CPVector> genVectors = new ArrayList<>();
@@ -399,7 +460,7 @@ public class CPVector {
         // Add Uri vectors for uris which do not end a slash
         if (!parsedUri.getPath().endsWith("/")) {
             Uri uriPathWithInj = parsedUri.buildUpon().encodedPath(parsedUri.getPath() + injectionChar).build();
-            CPVector idVector = new CPVector(uriPathWithInj.toString(), null, null, null, null, null, null);
+            CPVector idVector = new CPVector(uriPathWithInj.toString(), null, null, null, null, null, null, providerInfo);
             genVectors.add(idVector);
             // For vectors with at least two path segments, create uri vectors out of path segments (excluding the final segment)
             if (parsedUri.getPathSegments().size() > 1) {
@@ -415,22 +476,22 @@ public class CPVector {
                         }
                     }
                     Uri uriPathWithSegmentInj = parsedUri.buildUpon().encodedPath(path).build();
-                    CPVector uriSegmentVector = new CPVector(uriPathWithSegmentInj.toString(), null, null, null, null, null, null);
+                    CPVector uriSegmentVector = new CPVector(uriPathWithSegmentInj.toString(), null, null, null, null, null, null, providerInfo);
                     genVectors.add(uriSegmentVector);
                 }
             }
         }
 
         // Projection vector
-        genVectors.add(new CPVector(uri, new String[] {injectionChar}, null, null, null, null, null));
+        genVectors.add(new CPVector(parsedUri.toString(), new String[] {injectionChar}, null, null, null, null, null, providerInfo));
         // Sort vector
-        genVectors.add(new CPVector(uri, null, null, injectionChar, null, null, null));
+        genVectors.add(new CPVector(parsedUri.toString(), null, null, injectionChar, null, null, null, providerInfo));
         // Where vector
-        genVectors.add(new CPVector(uri, null, null, null, injectionChar, null, null));
+        genVectors.add(new CPVector(parsedUri.toString(), null, null, null, injectionChar, null, null, providerInfo));
         // ContentValues keys
         ContentValues valKey = new ContentValues();
         valKey.put(injectionChar, "123");
-        genVectors.add(new CPVector(uri, null, null, null, null, valKey, null));
+        genVectors.add(new CPVector(parsedUri.toString(), null, null, null, null, valKey, null, providerInfo));
 
         // Check for tainted query params before generating them
         boolean generateQueryVectors = true;
@@ -453,11 +514,11 @@ public class CPVector {
                 // Query param keys
                 HashMap<String, String> qParamKeyMap = new HashMap<>();
                 qParamKeyMap.put(injectionChar, "123");
-                genVectors.add(new CPVector(uri, null, null, null, null, null, qParamKeyMap));
+                genVectors.add(new CPVector(parsedUri.toString(), null, null, null, null, null, qParamKeyMap, providerInfo));
                 // Query param vals
                 HashMap<String, String> qParamValMap = new HashMap<>();
-                qParamValMap.put(InjectionPayload.getDefaultField(), "123" + injectionChar);
-                genVectors.add(new CPVector(uri, null, null, null, null, null, qParamValMap));
+                qParamValMap.put(InjectionPayload.getDefaultField(), injectionChar);
+                genVectors.add(new CPVector(parsedUri.toString(), null, null, null, null, null, qParamValMap, providerInfo));
             } else {
                 // Make a vector for each actual query string key/val
                 for (String key : parsedUri.getQueryParameterNames()) {
@@ -472,16 +533,16 @@ public class CPVector {
 
                         if (innerKey.equals(key)) {
                             qParamKeyMap.put(injectionChar, val);
-                            qParamValMap.put(innerKey, val + injectionChar);
+                            qParamValMap.put(innerKey, injectionChar);
                         } else {
                             qParamKeyMap.put(innerKey, val);
                             qParamValMap.put(innerKey, val);
                         }
                     }
                     // Query param keys
-                    genVectors.add(new CPVector(uri, null, null, null, null, null, qParamKeyMap));
+                    genVectors.add(new CPVector(parsedUri.toString(), null, null, null, null, null, qParamKeyMap, providerInfo));
                     // Query param vals
-                    genVectors.add(new CPVector(uri, null, null, null, null, null, qParamValMap));
+                    genVectors.add(new CPVector(parsedUri.toString(), null, null, null, null, null, qParamValMap, providerInfo));
                 }
             }
         }
@@ -520,8 +581,8 @@ public class CPVector {
         switch (vectorType) {
             case URI_ID:
             case URI_SEGMENT:
-                String uri = contentUri.replace(injectionChar, payload);
-                plVector = new CPVector(uri, projection, selectionArgs, sortOrder, where, mapToVals(), qParams);
+                String uri = getContentUri().replace(injectionChar, payload);
+                plVector = new CPVector(uri, projection, selectionArgs, sortOrder, where, mapToVals(), qParams, vectorConfig);
                 break;
             case PROJECTION:
                 if (!Util.nullOrEmpty(projection)) {
@@ -533,19 +594,19 @@ public class CPVector {
                             proj[i] = projection[i];
                         }
                     }
-                    plVector = new CPVector(contentUri, proj, selectionArgs, sortOrder, where, mapToVals(), qParams);
+                    plVector = new CPVector(getContentUri(), proj, selectionArgs, sortOrder, where, mapToVals(), qParams, vectorConfig);
                 }
                 break;
             case SORT_ORDER:
                 if (sortOrder != null) {
                     String sort = sortOrder.replace(injectionChar, payload);
-                    plVector = new CPVector(contentUri, projection, selectionArgs, sort, where, mapToVals(), qParams);
+                    plVector = new CPVector(getContentUri(), projection, selectionArgs, sort, where, mapToVals(), qParams, vectorConfig);
                 }
                 break;
             case WHERE:
                 if (where != null) {
                     String whr = where.replace(injectionChar, payload);
-                    plVector = new CPVector(contentUri, projection, selectionArgs, sortOrder, whr, mapToVals(), qParams);
+                    plVector = new CPVector(getContentUri(), projection, selectionArgs, sortOrder, whr, mapToVals(), qParams, vectorConfig);
                 }
                 break;
             case CVALS_KEY:
@@ -558,7 +619,7 @@ public class CPVector {
                             valKey.put(key, valuesMap.get(key));
                         }
                     }
-                    plVector = new CPVector(contentUri, projection, selectionArgs, sortOrder, where, valKey, qParams);
+                    plVector = new CPVector(getContentUri(), projection, selectionArgs, sortOrder, where, valKey, qParams, vectorConfig);
                 }
                 break;
             case QPARAM_KEY:
@@ -571,7 +632,7 @@ public class CPVector {
                             qparamKey.put(key, qParams.get(key));
                         }
                     }
-                    plVector = new CPVector(contentUri, projection, selectionArgs, sortOrder, where, mapToVals(), qparamKey);
+                    plVector = new CPVector(getContentUri(), projection, selectionArgs, sortOrder, where, mapToVals(), qparamKey, vectorConfig);
                 }
                 break;
             case QPARAM_VAL:
@@ -584,14 +645,13 @@ public class CPVector {
                             qparamVal.put(key, qParams.get(key));
                         }
                     }
-                    plVector = new CPVector(contentUri, projection, selectionArgs, sortOrder, where, mapToVals(), qparamVal);
+                    plVector = new CPVector(getContentUri(), projection, selectionArgs, sortOrder, where, mapToVals(), qparamVal, vectorConfig);
                 }
                 break;
         }
 
         if (plVector != null) {
             plVector.setType(vectorType);
-            copyProperties(plVector);
         }
 
         return plVector;
@@ -603,7 +663,7 @@ public class CPVector {
             return;
         }
         // Assumes only one injection marker..
-        if (contentUri != null && contentUri.endsWith(injectionChar)) {
+        if (getContentUri() != null && getContentUri().endsWith(injectionChar)) {
             vectorType = URI_ID;
         } else if (Util.listContains(getUri().getPathSegments(), injectionChar, true)) {
             vectorType = URI_SEGMENT;
@@ -630,28 +690,12 @@ public class CPVector {
         return vectorType == UNKNOWN;
     }
 
-    public HashSet<String> getReadQueryFields() {
-        return readQueryFields;
-    }
-
-    public void setReadQueryFields(HashSet<String> readFields) {
-        readQueryFields = readFields;
-    }
-
-    public HashSet<String> getUpdateQueryFields() {
-        return updateQueryFields;
-    }
-
-    public void setUpdateQueryFields(HashSet<String> updateFields) {
-        updateQueryFields = updateFields;
-    }
-
     public String getIdentifier() {
         // Use tables as identifiers for vectors with queries set, otherwise use a hash of the read/write fields
         if (getTable() != null) {
             return CPAuditReport.getVectorTableKey(this, getTable());
         } else {
-            return isQuery() ? Util.getHashStr(readQueryFields) : Util.getHashStr(updateQueryFields);
+            return Util.getHashStr(getFields());
         }
     }
 
@@ -700,7 +744,7 @@ public class CPVector {
 
     @Override
     public int hashCode() {
-        return Objects.hash(Util.getHashStr(getOpTypeString(), contentUri, vectorType, projection, where, selectionArgs, sortOrder, valuesMap, qParams, readQueryFields, updateQueryFields));
+        return Objects.hash(Util.getHashStr(getOpTypeString(), getContentUri(), vectorType, projection, where, selectionArgs, sortOrder, valuesMap, qParams, isQuery(), isUpdate(), getFields()));
     }
 
     @Override

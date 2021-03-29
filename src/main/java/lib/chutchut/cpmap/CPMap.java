@@ -4,9 +4,11 @@
 
 package lib.chutchut.cpmap;
 
+import android.content.ContentProviderClient;
 import android.content.ContentResolver;
 import android.content.ContentValues;
 import android.content.Context;
+import android.content.Intent;
 import android.content.pm.ActivityInfo;
 import android.content.pm.ComponentInfo;
 import android.content.pm.PackageInfo;
@@ -18,7 +20,10 @@ import android.database.Cursor;
 import android.database.sqlite.SQLiteException;
 import android.net.Uri;
 import android.os.Bundle;
+import android.os.DeadObjectException;
+import android.os.ParcelFileDescriptor;
 import android.os.PatternMatcher;
+import android.os.RemoteException;
 import android.util.Log;
 
 import com.google.common.base.CaseFormat;
@@ -28,11 +33,10 @@ import java.io.ByteArrayOutputStream;
 import java.io.File;
 import java.io.FileInputStream;
 import java.io.FileNotFoundException;
-import java.io.FileWriter;
 import java.io.IOException;
 import java.io.InputStream;
 import java.io.InputStreamReader;
-import java.io.PrintWriter;
+import java.lang.ref.WeakReference;
 import java.nio.charset.Charset;
 import java.util.ArrayList;
 import java.util.Arrays;
@@ -90,6 +94,7 @@ public class CPMap {
     private HashSet<String> invalidAuthorities = new HashSet<>();
     private HashSet<Uri> urisTraversed = new HashSet<>();
     private HashSet<Uri> urisDiscovered = new HashSet<>();
+    private HashMap<String, Integer> deadUriAuthCount = new HashMap<>();
     private HashSet<String> uriFieldBruteHashes = new HashSet<>();
     private Map<CPVector, LinkedHashSet<Payload>> vulnMap = new HashMap<>();
     private Map<String, ProviderInfo> providerMap = new HashMap<>();
@@ -98,9 +103,6 @@ public class CPMap {
     private CPMapDumpListener dumpListener;
     private CPMapQueryListener queryListener;
     private OxfordDictionary oxfordDictionary;
-
-    private PrintWriter errorLogWriter;
-    private boolean errorLogEnable = false;
 
     public static String[] androidProviders = new String[] {
             "android.support.v4.content.FileProvider",
@@ -144,10 +146,15 @@ public class CPMap {
     private int CUSTOM_DISCOVER_BRUTE_WORD_LIMIT = -1;
     private int CUSTOM_DISCOVER_BRUTE_PATH_DEPTH = -1;
 
+    private static final int EXECUTOR_THREAD_POOL = 150;
+    private static final int EXECUTOR_THREAD_LIMIT = 25;
+    private static final long EXECUTOR_THREAD_TIMEOUT_MINS = 30;
+
+    public static boolean USE_UNSTABLE_CONTENT_PROVIDER_CLIENT = true;
     public static final String ROW_CONCAT_DELIM = "!!!";
     public static Pattern fullContentUriRegex = Pattern.compile("(content://[^, \\]\\)]+)");
 
-    private class CursorMeta {
+    private static class CursorMeta {
         private boolean isNull = true;
         private int numRows = -1;
         private String[] cols = new String[0];
@@ -177,7 +184,7 @@ public class CPMap {
         }
     }
 
-    private class QueryResult extends TestResult {
+    private static class QueryResult extends TestResult {
         private CursorMeta cursorMetadata;
 
         public QueryResult(Cursor cur, CPVector vector, InjectionPayload pl) {
@@ -195,7 +202,7 @@ public class CPMap {
         }
     }
 
-    private class UpdateResult extends TestResult {
+    private static class UpdateResult extends TestResult {
         private int result;
 
         public UpdateResult(int res, CPVector vector, InjectionPayload pl) {
@@ -208,7 +215,7 @@ public class CPMap {
         }
     }
 
-    private class TestResult {
+    private static class TestResult {
         private boolean status;
         private CPExploit exploit;
 
@@ -230,13 +237,15 @@ public class CPMap {
         }
     }
 
-    private class ProviderBruteForceCallable implements Callable<List<Uri>> {
+    private static class ProviderBruteForceCallable implements Callable<List<Uri>> {
 
+        private WeakReference<CPMap> cpmap;
         private Uri uri;
         private Set<String> words;
         private ProviderInfo providerInfo;
 
-        public ProviderBruteForceCallable(Uri uri, Set<String> words, ProviderInfo providerInfo) {
+        public ProviderBruteForceCallable(CPMap cpmap, Uri uri, Set<String> words, ProviderInfo providerInfo) {
+            this.cpmap = new WeakReference<>(cpmap);
             this.uri = uri;
             this.words = words;
             this.providerInfo = providerInfo;
@@ -244,18 +253,20 @@ public class CPMap {
 
         @Override
         public List<Uri> call() {
-            logInf("Spidering base URI (" + uri + ") for further paths..");
-            Map<Uri, String[]> bruteRes = bruteUriPaths(uri, words, providerInfo);
-            logInf("Finished checking URI: " + uri);
+            cpmap.get().logInf("Spidering base URI (" + uri + ") for further paths..");
+            Map<Uri, String[]> bruteRes = cpmap.get().bruteUriPaths(uri, words, providerInfo);
+            cpmap.get().logInf("Finished checking URI: " + uri);
             return new ArrayList<>(bruteRes.keySet());
         }
     }
 
-    private class DexFileStringSearchCallable implements Callable<Set<String>> {
+    private static class DexFileStringSearchCallable implements Callable<Set<String>> {
 
+        private WeakReference<CPMap> cpmap;
         private File dexFile;
 
-        public DexFileStringSearchCallable(File dexFile) {
+        public DexFileStringSearchCallable(CPMap cpmap, File dexFile) {
+            this.cpmap = new WeakReference<>(cpmap);
             this.dexFile = dexFile;
         }
 
@@ -265,41 +276,17 @@ public class CPMap {
                 return null;
             }
 
-            logInf("Extracting strings from file: " + dexFile.getAbsolutePath());
-            ArrayList<String> strings = getStringsFromDex(dexFile);
-            logInf("Finished extracting strings from file: " + dexFile);
-            return new HashSet<>(filterStringsFromDex(strings));
+            cpmap.get().logInf("Extracting strings from file: " + dexFile.getAbsolutePath());
+            ArrayList<String> strings = cpmap.get().getStringsFromDex(dexFile);
+            cpmap.get().logInf("Finished extracting strings from file: " + dexFile);
+            return new HashSet<>(cpmap.get().filterStringsFromDex(strings));
         }
 
     }
 
-    private class BlindSqlDumpRowCallable implements Callable<BlindSqlDumpRowCallable> {
+    private static class BlindSqlDumpCharCallable implements Callable<BlindSqlDumpCharCallable> {
 
-        private CPVector vector;
-        private BooleanBlindPayload payload;
-        private String sql;
-        private ProviderInfo providerInfo;
-        private int rowIndex;
-        private String[] row;
-
-        public BlindSqlDumpRowCallable(CPVector vector, BooleanBlindPayload payload, String sql, ProviderInfo providerInfo, int rowIndex) {
-            this.vector = vector;
-            this.payload = payload;
-            this.sql = sql;
-            this.providerInfo = providerInfo;
-            this.rowIndex = rowIndex;
-        }
-
-        @Override
-        public BlindSqlDumpRowCallable call() {
-            row = getBlindRow(vector, payload, sql, providerInfo, rowIndex);
-            return this;
-        }
-
-    }
-
-    private class BlindSqlDumpCharCallable implements Callable<BlindSqlDumpCharCallable> {
-
+        private WeakReference<CPMap> cpmap;
         private CPVector vector;
         private BooleanBlindPayload payload;
         private String sql;
@@ -307,7 +294,8 @@ public class CPMap {
         private int charIndex;
         private char chr;
 
-        public BlindSqlDumpCharCallable(CPVector vector, BooleanBlindPayload payload, String sql, ProviderInfo providerInfo, int charIndex) {
+        public BlindSqlDumpCharCallable(CPMap cpmap, CPVector vector, BooleanBlindPayload payload, String sql, ProviderInfo providerInfo, int charIndex) {
+            this.cpmap = new WeakReference<>(cpmap);
             this.vector = vector;
             this.payload = payload;
             this.sql = sql;
@@ -317,7 +305,7 @@ public class CPMap {
 
         @Override
         public BlindSqlDumpCharCallable call() {
-            chr = (char) getBlindNumericVal(vector, payload, sql, providerInfo, BNUMTYPE_RESULT);
+            chr = (char) cpmap.get().getBlindNumericVal(vector, payload, sql, providerInfo, BNUMTYPE_RESULT);
             return this;
         }
 
@@ -343,7 +331,6 @@ public class CPMap {
         }
         initVulnMap();
         initOpts();
-        initErrorLog();
     }
 
     public CPMap(Context ctx, Bundle options, Collection<?> urisOrVectors) {
@@ -375,7 +362,8 @@ public class CPMap {
                     this.targetPkg = Util.getInstalledTarget(this.context, pInf.packageName);
                 }
                 if (this.targetPkg != null && pInf.packageName.equals(this.targetPkg.getTargetPkg())) {
-                    ArrayList<CPVector> genVectors = CPVector.getVectorsFromUri(inUri);
+                    ProviderInfo providerInfo = getProviderInfo(Uri.parse(inUri).getAuthority());
+                    ArrayList<CPVector> genVectors = CPVector.getVectorsFromUri(providerInfo, inUri);
                     if (!Util.nullOrEmpty(genVectors)) {
                         this.vectors.addAll(genVectors);
                     }
@@ -384,7 +372,6 @@ public class CPMap {
         }
         initVulnMap();
         initOpts();
-        initErrorLog();
     }
 
     public CPMap(Context ctx, Bundle options, CPReport report) {
@@ -394,7 +381,6 @@ public class CPMap {
         this.targetPkg = report.getTarget();
         initVulnMap();
         initOpts();
-        initErrorLog();
     }
 
     public void setLogListener(CPMapLogListener logListener) {
@@ -484,26 +470,80 @@ public class CPMap {
         return dumpRows;
     }
 
-    public boolean audit() {
+    public HashMap<String, String> auditPkgTables(HashMap<String, HashSet<String>> vectorTables) {
 
         if (!canDump()) {
-            return false;
+            return null;
         }
 
-        if (targetReport == null) {
+        if (targetReport == null || vectorTables == null || targetReport.getAuditReport() == null) {
             logErr("Null report");
-            return false;
+            return null;
         }
 
         CPReportTarget target = targetReport.getTarget();
         if (target == null || target.getTargetPkg() == null || target.getVersion() == null) {
             logErr("Null or invalid target");
-            return false;
+            return null;
         }
 
         if (!Util.pkgVersionisInstalled(context, target.getTargetPkg(), target.getVersion())) {
             logErr("Report package version is not installed: " + target);
-            return false;
+            return null;
+        }
+
+        HashMap<String, String> vectorTableCreateSqlMap = new HashMap<>();
+
+        for (CPVector vector : targetReport.getVectors()) {
+            String vKey = CPAuditReport.getVectorKey(vector);
+            if (vectorTables.containsKey(vKey) && vectorTables.get(vKey) != null) {
+                for (String table : vectorTables.get(vKey)) {
+                    // Ignore sqlite/android default tables..
+                    if (Util.listContains(sqliteDefaultTables, table, true)) {
+                        continue;
+                    }
+                    String vTableKey = CPAuditReport.getVectorTableKey(vector, table);
+                    if (targetReport.getAuditReport().getVectorTableCreateSql(vector, table) != null || (vectorTableCreateSqlMap.containsKey(vTableKey) && vectorTableCreateSqlMap.get(vTableKey) != null)) {
+                        logWarn("Already have table create SQL for vector/table: " + vTableKey);
+                        continue;
+                    }
+                    Payload dumpPayload = getPayloadForDumping(vector);
+                    if (dumpPayload != null) {
+                        ArrayList<String[]> createRows = dumpWithPayloadInternal(vector, dumpPayload, String.format("SELECT sql FROM sqlite_master WHERE type = 'table' AND tbl_name = '%s'", table));
+                        if (!Util.nullOrEmpty(createRows)) {
+                            String sql = createRows.get(0)[0];
+                            targetReport.getAuditReport().setVectorTableCreateSql(vector, table, sql);
+                            Util.saveReport(context, targetReport);
+                            vectorTableCreateSqlMap.put(vTableKey, sql);
+                        }
+                    }
+                }
+            }
+        }
+
+        return vectorTableCreateSqlMap;
+    }
+
+    public HashMap<String, HashSet<String>> auditPkgTables() {
+
+        if (!canDump()) {
+            return null;
+        }
+
+        if (targetReport == null) {
+            logErr("Null report");
+            return null;
+        }
+
+        CPReportTarget target = targetReport.getTarget();
+        if (target == null || target.getTargetPkg() == null || target.getVersion() == null) {
+            logErr("Null or invalid target");
+            return null;
+        }
+
+        if (!Util.pkgVersionisInstalled(context, target.getTargetPkg(), target.getVersion())) {
+            logErr("Report package version is not installed: " + target);
+            return null;
         }
 
         /*
@@ -515,8 +555,7 @@ public class CPMap {
          */
 
         String sqliteVersion = targetReport.getSqliteVersion();
-        HashMap<Integer, HashSet<String>> vectorTableMap = new HashMap<>();
-        HashMap<String, String> vectorTableCreateSql = new HashMap<>();
+        HashMap<String, HashSet<String>> vectorTableMap = new HashMap<>();;
 
         HashSet<CPVector> reportVectors = targetReport.getVectors();
         for (CPVector vector : reportVectors) {
@@ -535,7 +574,7 @@ public class CPMap {
                     }
                 }
 
-                int vectorKey = CPAuditReport.getVectorKey(vector);
+                String vectorKey = CPAuditReport.getVectorKey(vector);
                 if (!vectorTableMap.containsKey(vectorKey)) {
                     vectorTableMap.put(vectorKey, new HashSet<String>());
                 }
@@ -546,46 +585,17 @@ public class CPMap {
                 }
 
                 // Only get tables (not views etc)
-                HashSet<String> auditTables = new HashSet<>();
                 ArrayList<String[]> rows = dumpWithPayloadInternal(vector, dumpPayload, "SELECT DISTINCT tbl_name FROM sqlite_master WHERE type = 'table'");
                 if (!Util.nullOrEmpty(rows)) {
                     for (String[] row : rows) {
-                        String vectorTable = row[0];
-                        // Ignore sqlite/android default tables..
-                        if (Util.listContains(sqliteDefaultTables, vectorTable, true)) {
-                            continue;
-                        }
-                        auditTables.add(vectorTable);
-                    }
-
-                    if (!vectorTableMap.containsValue(auditTables)) {
-                        for (String auditTable : auditTables) {
-                            // Add the table to the map
-                            vectorTableMap.get(vectorKey).add(auditTable);
-                            String vectorTableKey = CPAuditReport.getVectorTableKey(vector, auditTable);
-                            // Get the CREATE SQL statement for each accessible table
-                            if (!vectorTableCreateSql.containsKey(vectorTableKey)) {
-                                ArrayList<String[]> createRows = dumpWithPayloadInternal(vector, dumpPayload, String.format("SELECT sql FROM sqlite_master WHERE type = 'table' AND tbl_name = '%s'", auditTable));
-                                if (!Util.nullOrEmpty(createRows)) {
-                                    vectorTableCreateSql.put(vectorTableKey, createRows.get(0)[0]);
-                                }
-                            }
-                        }
-                    } else {
-                        // Add all the tables to the map
-                        vectorTableMap.get(vectorKey).addAll(auditTables);
+                        vectorTableMap.get(vectorKey).add(row[0]);
                     }
                 }
             }
         }
 
-        // Close the error log writer if non null
-        if (errorLogWriter != null) {
-            errorLogWriter.close();
-        }
-
         // If audit report exists, update it, otherwise create a new instance
-        CPAuditReport aReport = new CPAuditReport(vectorTableMap, vectorTableCreateSql);
+        CPAuditReport aReport = new CPAuditReport(vectorTableMap);
         if (aReport.getAllAccessibleTables().size() > 0) {
             logInf(aReport.toString());
             if (targetReport.getSqliteVersion() == null && sqliteVersion != null) {
@@ -596,20 +606,10 @@ public class CPMap {
             } else {
                 targetReport.getAuditReport().update(aReport);
             }
-            return Util.saveReport(context, targetReport);
-        } else {
-            return false;
+            Util.saveReport(context, targetReport);
         }
-    }
 
-    private void initErrorLog() {
-        if (Util.hasPermission(context, "android.permission.WRITE_EXTERNAL_STORAGE") && errorLogEnable) {
-            try {
-                errorLogWriter = new PrintWriter(new FileWriter(context.getExternalFilesDir(null) + File.separator + "cpmap_error_log.txt", true), true);
-            } catch (IOException ioe) {
-                logErr("IOException initialising error log writer: " + ioe.getMessage());
-            }
-        }
+        return vectorTableMap;
     }
 
     private void initOpts() {
@@ -620,6 +620,14 @@ public class CPMap {
             defOpt.putAll(options);
             options = defOpt;
         }
+
+        // Verbose warnings for unclosed resources
+        /*
+        StrictMode.setVmPolicy(new StrictMode.VmPolicy.Builder()
+                .detectLeakedClosableObjects()
+                .penaltyLog()
+                .build());
+        */
     }
 
     private void initVulnMap() {
@@ -681,6 +689,15 @@ public class CPMap {
             logInf("Use specified payloads: " + Util.listToString(getArrayListOption("payloads")));
         }
 
+        if (getArrayListOption("operations") == null) {
+            logInf("Use all operations");
+        } else {
+            logInf("Use specified operations: " + Util.listToString(getArrayListOption("operations")));
+        }
+
+        String providerClient = USE_UNSTABLE_CONTENT_PROVIDER_CLIENT ? "Unstable" : "Stable";
+        logInf(providerClient + " ContentProviderClient will be used for Content Provider operations");
+
         if (targetPkg != null && getBooleanOption("refresh_cache")) {
             logWarn("Refreshing vector cache for package: " + targetPkg);
             removeCachedVectors(targetPkg);
@@ -716,13 +733,15 @@ public class CPMap {
             }
         } else {
             // Validate passed in vectors
+            ArrayList<CPVector> validVectors = new ArrayList<>();
             for (CPVector vector : vectors) {
                 if (!vector.isValid() || vector.isUnknownType()) {
                     logWarn("Invalid/unknown vector detected: " + vector);
                 } else {
-                    vectors.add(vector);
+                    validVectors.add(vector);
                 }
             }
+            vectors = new ArrayList<>(validVectors);
         }
 
         if (vectors.size() > 0) {
@@ -772,24 +791,8 @@ public class CPMap {
             }
         }
 
-        // Close the error log writer if non null
-        if (errorLogWriter != null) {
-            errorLogWriter.close();
-        }
-
         logInf("Test complete");
         return targetPkg != null && vulnMap.size() > 0 ? getReportFromMap(targetPkg, vulnMap, sqliteVersionStr) : null;
-    }
-
-    private String getVectorMapKey(CPVector vector) {
-        String vectorKey = vector.getTypeString() + "__" + vector.getUri().getAuthority();
-        // Distinguish between query/update vectors
-        if (vector.isQuery()) {
-            vectorKey = "QUERY_" + vectorKey;
-        } else {
-            vectorKey = "UPDATE_" + vectorKey;
-        }
-        return vectorKey;
     }
 
     private boolean shouldTraversePath(CPVector vector) {
@@ -815,7 +818,7 @@ public class CPMap {
                 if (tmpReport.hasHeuristicOnly()) {
                     continue;
                 }
-                String vectorKey = getVectorMapKey(vulnVector);
+                String vectorKey = CPAuditReport.getVectorKey(vulnVector);
                 if (!foundVulnAuthMap.containsKey(vectorKey)) {
                     foundVulnAuthMap.put(vectorKey, new ArrayList<String>());
                 }
@@ -825,7 +828,7 @@ public class CPMap {
                 }
             }
             // Check if the passed vector key and table aleady exists in the map, if it does dont scan it
-            String targetVectorKey = getVectorMapKey(vector);
+            String targetVectorKey = CPAuditReport.getVectorKey(vector);
             if (!foundVulnAuthMap.containsKey(targetVectorKey) || !foundVulnAuthMap.get(targetVectorKey).contains(vector.getIdentifier())) {
                 // If the existing map does not contain target vector key or table, scan it!
                 return true;
@@ -840,6 +843,9 @@ public class CPMap {
             for (CPVector vector : vulnMap.keySet()) {
                 if (vector.getTable() != null) {
                     tables.add(vector.getTable());
+                }
+                if (targetReport != null && targetReport.getAuditReport() != null && targetReport.getAuditReport().getAccessibleTables(vector) != null) {
+                    tables.addAll(targetReport.getAuditReport().getAccessibleTables(vector));
                 }
             }
         }
@@ -858,24 +864,30 @@ public class CPMap {
          * Validate them first!
          */
 
-        Payload payload = getPayloadOfType(vector, ProjectionPayload.TYPE);
-        if (payload != null && validateVector(vector, payload)) {
-            return payload;
+        // Iterate though the payloads stored in vulnMap
+        List<Payload> projPayloads = getPayloadsOfType(vector, ProjectionPayload.TYPE);
+        List<Payload> selPayloads = getPayloadsOfType(vector, SelectionPayload.TYPE);
+        List<Payload> unionPayloads = getPayloadsOfType(vector, UnionPayload.TYPE);
+        List<Payload> boolPayloads = getPayloadsOfType(vector, BooleanBlindPayload.TYPE);
+
+        List<Payload> allPayloads = new ArrayList<>();
+        if (!Util.nullOrEmpty(projPayloads)) {
+            allPayloads.addAll(projPayloads);
+        }
+        if (!Util.nullOrEmpty(selPayloads)) {
+            allPayloads.addAll(selPayloads);
+        }
+        if (!Util.nullOrEmpty(unionPayloads)) {
+            allPayloads.addAll(unionPayloads);
+        }
+        if (!Util.nullOrEmpty(boolPayloads)) {
+            allPayloads.addAll(boolPayloads);
         }
 
-        payload = getPayloadOfType(vector, SelectionPayload.TYPE);
-        if (payload != null && validateVector(vector, payload)) {
-            return payload;
-        }
-
-        payload = getPayloadOfType(vector, UnionPayload.TYPE);
-        if (payload != null && validateVector(vector, payload)) {
-            return payload;
-        }
-
-        payload = getPayloadOfType(vector, BooleanBlindPayload.TYPE);
-        if (payload != null && validateBooleanVector(vector, (BooleanBlindPayload) payload)) {
-            return payload;
+        for (Payload payload : allPayloads) {
+            if (validateVectorPayloadCombo(vector, payload)) {
+                return payload;
+            }
         }
 
         return null;
@@ -920,6 +932,7 @@ public class CPMap {
     }
 
     private ProviderInfo getProviderInfo(String authority) {
+        authority = authority.replace(CPVector.injectionChar, "");
         if (providerMap.containsKey(authority)) {
             return providerMap.get(authority);
         } else {
@@ -983,9 +996,8 @@ public class CPMap {
         return null;
     }
 
-    private int canUpdateVectorWithPayload(CPVector vector, BooleanBlindPayload payload) {
+    private int canUpdateVectorWithPayload(BooleanBlindPayload.Builder builder) {
 
-        BooleanBlindPayload.Builder builder = new BooleanBlindPayload.Builder(payload, vector);
         try {
             CPVector rendered = builder.getRenderedVector();
             return update(rendered.getUri(), rendered.getValues(), rendered.getWhere(), rendered.getSelectionArgs());
@@ -996,7 +1008,7 @@ public class CPMap {
                     if (builder.build().getConditions().size() < DISCOVER_COLCOND_LIMIT) {
                         builder.addPlaceholderCondition();
                         logWarn("'Cannot bind argument' error returned for payload, added condition/placeholder to payload, now: " + builder.build());
-                        return canUpdateVectorWithPayload(builder.getVector(), builder.build());
+                        return canUpdateVectorWithPayload(builder);
                     } else {
                         logWarn("'Cannot bind argument' error returned for payload, given up adding condition/placeholder to payload :(");
                     }
@@ -1019,14 +1031,14 @@ public class CPMap {
                                 builder.addPlaceholderCondition();
                             }
                             logWarn("Added " + addArg + " arg(s) to payload for binding, now: " + builder.build());
-                            return canUpdateVectorWithPayload(builder.getVector(), builder.build());
+                            return canUpdateVectorWithPayload(builder);
                         }
                     }
                 } else if (e.getMessage().contains("no such column: rowid")) {
                     // WITHOUT ROWID tables (https://www.sqlite.org/withoutrowid.html)? Modify the boolBuilder.getVector() in-place and retry
                     logWarn("'no such column: rowid' error returned for boolean update query, probable WITHOUT ROWID table");
                     if (builder.handleWithoutRowid(builder.getVector())) {
-                        return canUpdateVectorWithPayload(builder.getVector(), builder.build());
+                        return canUpdateVectorWithPayload(builder);
                     }
                 } else if (e.getMessage().contains("datatype mismatch")) {
                     // Means the query was valid and record update was attempted, but types didnt match, return 1
@@ -1043,22 +1055,32 @@ public class CPMap {
         return -1;
     }
 
-    private boolean validateVector(CPVector vector, Payload payload) {
+    private boolean validateVectorPayloadCombo(CPVector vector, Payload payload) {
         boolean res;
         // Check to see if the vector/payload combo has already been validated
-        String vectorPayloadMapKey = vector.hashCode() + ":" + payload.hashCode();
+        String vectorPayloadMapKey = CPAuditReport.getVectorKey(vector) + ":" + payload.hashCode();
         if (vectorPayloadValidationMap.containsKey(vectorPayloadMapKey) && vectorPayloadValidationMap.get(vectorPayloadMapKey) != null) {
-            return vectorPayloadValidationMap.get(vectorPayloadMapKey);
+            res = vectorPayloadValidationMap.get(vectorPayloadMapKey);
+            logInf(String.format("Using stored validation result for vector: (%s), with payload: %s. Result: %s", vector, payload, res ? "Valid" : "Invalid"));
+            return res;
         }
 
+        boolean initRes = true;
         if (payload.getType() == BooleanBlindPayload.TYPE) {
-            res = validateBooleanVector(vector, (BooleanBlindPayload) payload);
-        } else {
-            ArrayList<String[]> rows = dumpWithPayloadInternal(vector, payload, "SELECT sqlite_version()");
-            res = !Util.nullOrEmpty(rows);
+            // Boolean has two stages, validate the payload, then dump and check the output
+            initRes = validateBooleanVector(vector, (BooleanBlindPayload) payload);
         }
 
-        logInf(String.format("Validating vector: %s with payload: %s. Result: %s", vector, payload, res ? "Valid" : "Invalid"));
+        if (initRes) {
+            // Only perform second stage validation if payload is not boolean or the boolean payload was valid
+            ArrayList<String[]> rows = dumpWithPayloadInternal(vector, payload, "SELECT sqlite_version()");
+            // Dump output should start with '3.'
+            res = !Util.nullOrEmpty(rows) && rows.get(0)[0].trim().startsWith("3.");
+        } else {
+            res = false;
+        }
+
+        logInf(String.format("Validating vector: (%s), with payload: %s. Result: %s", vector, payload, res ? "Valid" : "Invalid"));
 
         // Store the validation result so its not repeated
         vectorPayloadValidationMap.put(vectorPayloadMapKey, res);
@@ -1282,59 +1304,67 @@ public class CPMap {
         return null;
     }
 
-    private Payload getPayloadOfType(CPVector vector, int pltype) {
+    private List<Payload> getPayloadsOfType(CPVector vector, int pltype) {
+        ArrayList<Payload> payloadsOfType = new ArrayList<>();
         if (vulnMap != null && vulnMap.size() > 0 && vulnMap.containsKey(vector)) {
             if (getStringOption("dump_vector") != null && !vector.getTypeString().equalsIgnoreCase(getStringOption("dump_vector"))) {
-                return null;
+                return new ArrayList<>();
             }
-            if (getStringOption("dump_table") != null && vector.getTable() != null && !vector.getTable().equalsIgnoreCase(getStringOption("dump_table"))) {
-                return null;
+            if (getStringOption("dump_table") != null) {
+                String dumpTable = getStringOption("dump_table");
+                if (vector.getTable() != null && !vector.getTable().equalsIgnoreCase(dumpTable)) {
+                    return new ArrayList<>();
+                } else if (targetReport != null && targetReport.getAuditReport() != null && (targetReport.getAuditReport().getAccessibleTables(vector) == null || !targetReport.getAuditReport().getAccessibleTables(vector).contains(dumpTable))) {
+                    return new ArrayList<>();
+                }
             }
 
             LinkedHashSet<Payload> payloads = vulnMap.get(vector);
-            for (Payload payload : payloads) {
-                if (payload.getType() != pltype) {
-                    continue;
-                }
-                if (getStringOption("dump_payload") != null && !payload.getTypeString().equalsIgnoreCase(getStringOption("dump_payload"))) {
-                    continue;
-                }
+            if (payloads != null) {
+                for (Payload payload : payloads) {
+                    if (payload.getType() != pltype) {
+                        continue;
+                    }
+                    if (getStringOption("dump_payload") != null && !payload.getTypeString().equalsIgnoreCase(getStringOption("dump_payload"))) {
+                        continue;
+                    }
 
-                switch (payload.getType()) {
-                    case BooleanBlindPayload.TYPE:
-                        if (((BooleanBlindPayload) payload).isSupportedVector(vector)) {
-                            return payload;
-                        }
-                        break;
-                    case UnionPayload.TYPE:
-                        if (((UnionPayload) payload).isSupportedVector(vector)) {
-                            return payload;
-                        }
-                        break;
-                    case ProjectionPayload.TYPE:
-                        if (((ProjectionPayload) payload).isSupportedVector(vector)) {
-                            return payload;
-                        }
-                        break;
-                    case SelectionPayload.TYPE:
-                        if (((SelectionPayload) payload).isSupportedVector(vector)) {
-                            return payload;
-                        }
-                        break;
-                    case PathTraversalPayload.TYPE:
-                        if (((PathTraversalPayload) payload).isSupportedVector(vector)) {
-                            return payload;
-                        }
-                        break;
-                    case HeuristicPayload.TYPE:
-                        if (((HeuristicPayload) payload).isSupportedVector(vector)) {
-                            return payload;
-                        }
-                        break;
+                    switch (payload.getType()) {
+                        case BooleanBlindPayload.TYPE:
+                            if (((BooleanBlindPayload) payload).isSupportedVector(vector)) {
+                                payloadsOfType.add(payload);
+                            }
+                            break;
+                        case UnionPayload.TYPE:
+                            if (((UnionPayload) payload).isSupportedVector(vector)) {
+                                payloadsOfType.add(payload);
+                            }
+                            break;
+                        case ProjectionPayload.TYPE:
+                            if (((ProjectionPayload) payload).isSupportedVector(vector)) {
+                                payloadsOfType.add(payload);
+                            }
+                            break;
+                        case SelectionPayload.TYPE:
+                            if (((SelectionPayload) payload).isSupportedVector(vector)) {
+                                payloadsOfType.add(payload);
+                            }
+                            break;
+                        case PathTraversalPayload.TYPE:
+                            if (((PathTraversalPayload) payload).isSupportedVector(vector)) {
+                                payloadsOfType.add(payload);
+                            }
+                            break;
+                        case HeuristicPayload.TYPE:
+                            if (((HeuristicPayload) payload).isSupportedVector(vector)) {
+                                payloadsOfType.add(payload);
+                            }
+                            break;
+                    }
                 }
             }
         }
-        return null;
+        return payloadsOfType;
     }
 
     public static HashSet<Uri> getProviderUrisFromPathPermissions(ProviderInfo providerInfo) {
@@ -1350,40 +1380,63 @@ public class CPMap {
         } else {
             authority = providerInfo.authority;
         }
-        String base = "content://" + authority + "/";
+        String base = "content://" + authority;
         HashSet<String> paths = new HashSet<>();
         HashSet<Uri> uris = new HashSet<>();
         if (providerInfo.pathPermissions != null) {
             for (PathPermission pathPerm : providerInfo.pathPermissions) {
-                String path = pathPerm.getPath();
-                // Trim the leading slash
-                if (path.indexOf('/') == 0) {
-                    path = path.substring(1);
+                String path = pathPerm.getPath().trim();
+                if (path.length() > 0) {
+                    // Add words/paths from path permissions. Also deal with wildcards in path patterns
+                    // https://developer.android.com/guide/topics/manifest/path-permission-element
+                    if (!path.contains("*")) {
+                        // No wildcard
+                        paths.add(path);
+                    } else if (path.contains(".*")) {
+                        // Wildcard type 1
+                        paths.add(path.replace(".*", ""));
+                        paths.add(path.replace(".*", "1"));
+                    } else if (path.contains("*")) {
+                        // Wildcard type 2
+                        paths.add(path.replace("*", ""));
+                    }
                 }
-
-                // Add words/paths from path permissions. Also deal with wildcards in path patterns
-                // https://developer.android.com/guide/topics/manifest/path-permission-element
-                if (!path.contains("*")) {
-                    // No wildcard
-                    paths.add(path);
-                } else if (path.contains(".*")) {
-                    // Wildcard type 1
-                    paths.add(path.replace(".*", ""));
-                    paths.add(path.replace(".*", "1"));
-                } else if (path.contains("*")) {
-                    // Wildcard type 2
-                    paths.add(path.replace("*", ""));
-                }
-            }
-
-            for (String path : paths) {
-                // Normalise double slashes to single slashes
-                if (path.contains("//")) {
-                    path = path.replaceAll("//", "/");
-                }
-                uris.add(Uri.parse(base + path));
             }
         }
+
+        if (providerInfo.uriPermissionPatterns != null) {
+            for (PatternMatcher pathPatternMatcher : providerInfo.uriPermissionPatterns) {
+                String path = pathPatternMatcher.getPath().trim();
+                if (path.length() > 0) {
+                    // Add words/paths from uri path permissions. Also deal with wildcards in path patterns
+                    // https://developer.android.com/guide/topics/manifest/grant-uri-permission-element
+                    if (!path.contains("*")) {
+                        // No wildcard
+                        paths.add(path);
+                    } else if (path.contains(".*")) {
+                        // Wildcard type 1
+                        paths.add(path.replace(".*", ""));
+                        paths.add(path.replace(".*", "1"));
+                    } else if (path.contains("*")) {
+                        // Wildcard type 2
+                        paths.add(path.replace("*", ""));
+                    }
+                }
+            }
+        }
+
+        for (String path : paths) {
+            // Ensure leading slash
+            if (!path.startsWith("/")) {
+                path = "/" + path;
+            }
+            // Normalise double slashes to single slashes
+            if (path.contains("//")) {
+                path = path.replaceAll("//", "/");
+            }
+            uris.add(Uri.parse(base + path));
+        }
+
         return uris;
     }
 
@@ -1429,9 +1482,7 @@ public class CPMap {
             logInf("Set custom discovery path depth to: " + CUSTOM_DISCOVER_BRUTE_PATH_DEPTH);
         }
 
-        // Init ThreadPoolExecutor for the callables
-        BlockingQueue<Runnable> blockingQueue = new ArrayBlockingQueue<>(50);
-        ThreadPoolExecutor executor = new ThreadPoolExecutor(10, 10, 1000, TimeUnit.MILLISECONDS, blockingQueue, new ThreadPoolExecutor.CallerRunsPolicy());
+        ThreadPoolExecutor executor = getThreadPool();
 
         // If strings binary exists, extract APK and read strings from .dex files
         Set<String> apkWords = new HashSet<>();
@@ -1480,12 +1531,15 @@ public class CPMap {
                             byte[] entryBytes = getZipFileBytes(apkZip, entry);
                             boolean copy = Util.copyBytesToFile(entryBytes, dexCache);
                             if (copy) {
-                                callList.add(new DexFileStringSearchCallable(dexCache));
+                                callList.add(new DexFileStringSearchCallable(this, dexCache));
                             } else {
                                 logWarn("Failed to copy dex file: " + entryName);
                             }
                         }
                     }
+
+                    // Finished with the Zip/APK file, so close it
+                    apkZip.close();
 
                     if (callList.size() == 0) {
                         logWarn("No dex files found in target APK");
@@ -1494,8 +1548,8 @@ public class CPMap {
 
                         try {
                             logInf("Queuing " + callList.size() + " thread(s) to extract strings from dex files");
-                            // invokeAll() should block until all are complete, or timeout after 15 mins
-                            List<Future<Set<String>>> futures = executor.invokeAll(callList, 15, TimeUnit.MINUTES);
+                            // invokeAll() should block until all are complete, or timeout
+                            List<Future<Set<String>>> futures = executor.invokeAll(callList, EXECUTOR_THREAD_TIMEOUT_MINS, TimeUnit.MINUTES);
 
                             // Threads have finished
                             logInf("String extraction threads have finished");
@@ -1520,6 +1574,8 @@ public class CPMap {
 
                         } catch (InterruptedException ie) {
                             logErr("InterruptedException: " + ie.getMessage());
+                        } finally {
+                            executor.shutdown();
                         }
                     }
                     if (!customApk) {
@@ -1537,10 +1593,7 @@ public class CPMap {
         Set<String> appWords = new HashSet<>();
         HashSet<Uri> urisDiscoveredToAdd = new HashSet<>();
         try {
-            pkgInfo = context.getPackageManager().getPackageInfo(targetPkg.getTargetPkg(), PackageManager.GET_ACTIVITIES|PackageManager.GET_PROVIDERS|PackageManager.GET_RECEIVERS|PackageManager.GET_SERVICES);
-        } catch (PackageManager.NameNotFoundException nnfe) {
-            logErr("NameNotFoundException: " + nnfe.getMessage());
-            return null;
+            pkgInfo = Util.getPackageInfo(context, targetPkg.getTargetPkg());
         } catch (RuntimeException re) {
             logErr("RuntimeException: " + re.getMessage());
             try {
@@ -1635,7 +1688,7 @@ public class CPMap {
             for (String uri : existingUris) {
                 String uriPkg = Util.getPackageNameByAuthority(Uri.parse(uri).getAuthority(), context);
                 if (uriPkg != null && uriPkg.equals(targetPkg.getTargetPkg())) {
-                    genVectors.addAll(CPVector.getVectorsFromUri(uri));
+                    genVectors.addAll(CPVector.getVectorsFromUri(getProviderInfo(Uri.parse(uri).getAuthority()), uri));
                 }
             }
             logInf("Adding " + genVectors.size() + " vectors from the existing report");
@@ -1644,7 +1697,7 @@ public class CPMap {
 
         for (Uri uriToAdd : urisDiscoveredToAdd) {
             logInf("Generating vector(s) for Uri: " + uriToAdd);
-            ArrayList<CPVector> genVectors = CPVector.getVectorsFromUri(uriToAdd.toString());
+            ArrayList<CPVector> genVectors = CPVector.getVectorsFromUri(getProviderInfo(uriToAdd.getAuthority()), uriToAdd.toString());
             if (genVectors != null && genVectors.size() > 0) {
                 logInf("Got " + genVectors.size() + " vectors for Uri: " + uriToAdd);
                 dVectors.addAll(genVectors);
@@ -1659,11 +1712,11 @@ public class CPMap {
             if (contUris != null && contUris.size() > 0) {
                 // Spider found uris
                 Set<Uri> uriSet = new HashSet<>(contUris.keySet());
-                Set<Uri> spiderUris = spiderFoundUris(contUris, wordList, executor);
+                Set<Uri> spiderUris = spiderFoundUris(contUris, appWords, wordList);
                 uriSet.addAll(spiderUris);
                 for (Uri uri : uriSet) {
                     logInf("Generating vector(s) for Uri: " + uri);
-                    ArrayList<CPVector> genVectors = CPVector.getVectorsFromUri(uri.toString());
+                    ArrayList<CPVector> genVectors = CPVector.getVectorsFromUri(getProviderInfo(uri.getAuthority()), uri.toString());
                     if (genVectors != null && genVectors.size() > 0) {
                         logInf("Got " + genVectors.size() + " vectors for Uri: " + uri);
                         dVectors.addAll(genVectors);
@@ -1751,10 +1804,17 @@ public class CPMap {
                 String match = mUri.group(1);
                 if (!urisDiscovered.contains(match)) {
                     Uri foundUri = Uri.parse(match);
-                    // If the authority contains invalid chars ie format placeholders skip it
-                    if (foundUri.getAuthority() == null || foundUri.getAuthority().contains("%")) {
+                    // If the authority is null skip it
+                    if (foundUri.getAuthority() == null) {
                         logWarn("Skipping URI with invalid authority: " + foundUri);
                         continue;
+                    } else if (foundUri.getAuthority().contains("%s") && targetPkg != null) {
+                        try {
+                            // Try replacing authority placeholder with pkg name
+                            foundUri = Uri.parse(String.format(Locale.getDefault(), foundUri.toString(), targetPkg.getTargetPkg()));
+                        } catch (Exception e) {
+                            logWarn("Exception replacing authority placeholder, too many placeholders? Exception: " + e.getMessage());
+                        }
                     }
                     // Only add the full uri if it has at least one path segment
                     if (foundUri.getPathSegments().size() > 0) {
@@ -1940,27 +2000,38 @@ public class CPMap {
             return false;
         }
 
-        Set<TestResult> heurRes = new HashSet<>();
+        Set<TestResult> detectionResults = new HashSet<>();
+        Set<TestResult> heuristicDetections = null;
+        Set<TestResult> booleanDetections = null;
+
         if (getBooleanOption("heuristic_detection")) {
             // Use original vector ref for heuristic test, as properties set will be inherited by copies
-            heurRes.addAll(testHeuristic(vector, pInfo));
+            heuristicDetections = testHeuristic(vector, pInfo);
+            detectionResults.addAll(heuristicDetections);
+            if (heuristicDetections.size() > 0) {
+                logInf("Got " + heuristicDetections.size() + " result(s) from heuristic (error-based) detection test for vector: " + vector.toString());
+            }
         }
-        if (vector.getQuery() == null && getBooleanOption("blind_detection")) {
-            // Perform blind detection test for supported vectors (wont have query set)
-            heurRes.addAll(testBlindDetection(vector, pInfo));
+        if ((heuristicDetections == null || heuristicDetections.size() == 0) && getBooleanOption("blind_detection")) {
+            // Perform blind detection test for supported vectors (wont have query set), if error-based detection did not yield a result
+            booleanDetections = testBlindDetection(vector, pInfo);
+            detectionResults.addAll(booleanDetections);
+            if (booleanDetections.size() > 0) {
+                logInf("Got " + booleanDetections.size() + " result(s) from boolean blind detection test for vector: " + vector.toString());
+            }
         }
 
-        if (heurRes.size() > 0) {
+        if (detectionResults.size() > 0) {
             gotHeuristic = true;
-            for (TestResult heurResult : heurRes) {
-                String query = heurResult.getVector().getQuery();
+            for (TestResult detectResult : detectionResults) {
+                String query = detectResult.getVector().getQuery();
                 if (query != null) {
-                    logWarn(String.format("Got potentially vulnerable Uri: %s Type: %s (%s)", heurResult.getVector().getUri(), heurResult.getVector().getTypeString(), query));
+                    logWarn(String.format("Got potentially vulnerable Uri: %s Type: %s (%s)", detectResult.getVector().getUri(), detectResult.getVector().getTypeString(), query));
                 } else {
-                    logWarn(String.format("Got potentially vulnerable Uri (via blind detection): %s Type: %s", heurResult.getVector().getUri(), heurResult.getVector().getTypeString()));
+                    logWarn(String.format("Got potentially vulnerable Uri (via blind detection): %s Type: %s", detectResult.getVector().getUri(), detectResult.getVector().getTypeString()));
                 }
 
-                testVectorInjection = shouldTestVectorForInjection(heurResult.getVector());
+                testVectorInjection = shouldTestVectorForInjection(detectResult.getVector());
                 if (testVectorInjection) {
                     for (InjectionPayload injectionPayload : injectionPayloads) {
                         // Skip payloads based on options
@@ -1975,21 +2046,24 @@ public class CPMap {
 
                         if (injectionPayload.getType() == BooleanBlindPayload.TYPE) {
                             // Boolean (query and update)
-                            CPVector boolVector = heurResult.getVector().copy();
+                            CPVector boolVector = detectResult.getVector().copy();
                             BooleanBlindPayload payload = (BooleanBlindPayload) injectionPayload;
-                            QueryResult testResult = testBooleanBlindQuery(boolVector, payload, pInfo);
-                            if (testResult.getStatus()) {
-                                addTestResultToVulnMap(testResult);
-                                numBoolVuln++;
-                            }
-                            UpdateResult testUpdResult = testBooleanBlindUpdate(boolVector, payload, pInfo);
-                            if (testUpdResult.getStatus()) {
-                                addTestResultToVulnMap(testUpdResult);
-                                numBoolVuln++;
+                            if (boolVector.isQuery()) {
+                                QueryResult testResult = testBooleanBlindQuery(boolVector, payload, pInfo);
+                                if (testResult.getStatus()) {
+                                    addTestResultToVulnMap(testResult);
+                                    numBoolVuln++;
+                                }
+                            } else if (boolVector.isUpdate()) {
+                                UpdateResult testUpdResult = testBooleanBlindUpdate(boolVector, payload, pInfo);
+                                if (testUpdResult.getStatus()) {
+                                    addTestResultToVulnMap(testUpdResult);
+                                    numBoolVuln++;
+                                }
                             }
                         } else if (injectionPayload.getType() == UnionPayload.TYPE) {
                             // UNION
-                            CPVector unionVector = heurResult.getVector().copy();
+                            CPVector unionVector = detectResult.getVector().copy();
                             UnionPayload payload = (UnionPayload) injectionPayload;
                             QueryResult testResult = testUnion(unionVector, payload, pInfo);
                             if (testResult.getStatus()) {
@@ -1998,7 +2072,7 @@ public class CPMap {
                             }
                         } else if (injectionPayload.getType() == ProjectionPayload.TYPE) {
                             // Projection
-                            CPVector projectionVector = heurResult.getVector().copy();
+                            CPVector projectionVector = detectResult.getVector().copy();
                             ProjectionPayload payload = (ProjectionPayload) injectionPayload;
                             QueryResult testResult = testProjection(projectionVector, payload, pInfo);
                             if (testResult.getStatus()) {
@@ -2007,7 +2081,7 @@ public class CPMap {
                             }
                         } else if (injectionPayload.getType() == SelectionPayload.TYPE) {
                             // Selection
-                            CPVector selectionVector = heurResult.getVector().copy();
+                            CPVector selectionVector = detectResult.getVector().copy();
                             SelectionPayload payload = (SelectionPayload) injectionPayload;
                             QueryResult testResult = testSelection(selectionVector, payload, pInfo);
                             if (testResult.getStatus()) {
@@ -2017,7 +2091,7 @@ public class CPMap {
                         }
                     }
                 } else {
-                    logWarn(String.format("Skipping injection tests for vector (%s) as a similar vulnerable vector already exists", heurResult.getVector()));
+                    logWarn(String.format("Skipping injection tests for vector (%s) as a similar vulnerable vector already exists", detectResult.getVector()));
                 }
             }
         }
@@ -2040,10 +2114,6 @@ public class CPMap {
                     PathTraversalPayload payload = (PathTraversalPayload) uriPathPayload;
                     TestResult testResult = testPathTraversal(travVector, payload);
                     if (testResult.getStatus()) {
-                        // If provider properties are not set, set them
-                        if (testResult.getVector().getProviderClass() == null) {
-                            testResult.getVector().setProviderProperties(pInfo);
-                        }
                         addTestResultToVulnMap(testResult);
                         numTravVuln++;
                     }
@@ -2052,24 +2122,24 @@ public class CPMap {
         }
 
         if (numBoolVuln > 0) {
-            logWarn("Found " + numBoolVuln + " boolean injection payloads for vector");
+            logWarn("Found " + numBoolVuln + " boolean injection payloads for vector: " + vector.toString());
         }
         if (numUnionVuln > 0) {
-            logWarn("Found " + numUnionVuln + " UNION injection payloads for vector");
+            logWarn("Found " + numUnionVuln + " UNION injection payloads for vector: " + vector.toString());
         }
         if (numProjVuln > 0) {
-            logWarn("Found " + numProjVuln + " projection injection payloads for vector");
+            logWarn("Found " + numProjVuln + " projection injection payloads for vector: " + vector.toString());
         }
         if (numSelVuln > 0) {
-            logWarn("Found " + numSelVuln + " selection injection payloads for vector");
+            logWarn("Found " + numSelVuln + " selection injection payloads for vector: " + vector.toString());
         }
         if (numTravVuln > 0) {
-            logWarn("Found " + numTravVuln + " path traversal payloads for vector");
+            logWarn("Found " + numTravVuln + " path traversal payloads for vector: " + vector.toString());
         }
 
         if (gotHeuristic && testVectorInjection && (numBoolVuln == 0 && numUnionVuln == 0 && numProjVuln == 0 && numSelVuln == 0)) {
-            // Got positive heuristic result but no valid injection payloads
-            for (TestResult testResult : heurRes) {
+            // Got positive detection result but no valid injection payloads
+            for (TestResult testResult : detectionResults) {
                 addTestResultToVulnMap(testResult);
             }
         }
@@ -2081,12 +2151,7 @@ public class CPMap {
 
         switch (testResult.getPayload().getType()) {
             case BooleanBlindPayload.TYPE:
-                String op;
-                if (testResult instanceof QueryResult) {
-                    op = "query()";
-                } else {
-                    op = "update()";
-                }
+                String op = (testResult instanceof QueryResult) ? "query()" : "update()";
                 logWarn("Found " + op + " vector (" + testResult.getVector() + ") vulnerable to boolean blind injection with payload: " + testResult.getPayload());
                 break;
             case UnionPayload.TYPE:
@@ -2209,7 +2274,7 @@ public class CPMap {
                 if (e.getMessage() != null) {
                     if (e.getMessage().contains("no such column: rowid")) {
                         // WITHOUT ROWID tables (https://www.sqlite.org/withoutrowid.html)? Modify in-place and retry
-                        logWarn("'no such column: rowid' error returned for UNION query, probable WITHOUT ROWID table");
+                        logWarn("'no such column: rowid' error returned, probable WITHOUT ROWID table");
                         if (selBuilder.handleWithoutRowid(selBuilder.getVector())) {
                             return testSelection(selBuilder.getVector(), selBuilder.build(), pInfo);
                         }
@@ -2300,6 +2365,11 @@ public class CPMap {
 
     }
 
+    private ThreadPoolExecutor getThreadPool() {
+        BlockingQueue<Runnable> blockingQueue = new ArrayBlockingQueue<>(EXECUTOR_THREAD_POOL);
+        return new ThreadPoolExecutor(EXECUTOR_THREAD_LIMIT, EXECUTOR_THREAD_LIMIT, EXECUTOR_THREAD_TIMEOUT_MINS, TimeUnit.MINUTES, blockingQueue, new ThreadPoolExecutor.CallerRunsPolicy());
+    }
+
     private String[] getBlindRow(CPVector vector, BooleanBlindPayload payload, String sql, ProviderInfo providerInfo, int rowNum) {
         String dumpSql;
         String[] rowArray = null;
@@ -2309,9 +2379,7 @@ public class CPMap {
             dumpSql = sql;
         }
         boolean concatFields = true;
-        // Init ThreadPoolExecutor for the callables
-        BlockingQueue<Runnable> blockingQueue = new ArrayBlockingQueue<>(50);
-        ThreadPoolExecutor executor = new ThreadPoolExecutor(10, 10, 1000, TimeUnit.MILLISECONDS, blockingQueue, new ThreadPoolExecutor.CallerRunsPolicy());
+        ThreadPoolExecutor executor = getThreadPool();
         // Get length of concatenated row data
         int rowLen = getBlindNumericVal(vector, payload, dumpSql, providerInfo, BNUMTYPE_LENGTH);
         if (rowLen < 0) {
@@ -2349,14 +2417,14 @@ public class CPMap {
                                 // Field has data, get it
                                 for (int k = 0; k < fieldLens[j]; k++) {
                                     String charQuery = String.format(Locale.UK, "SELECT unicode(substr((%s), %d, 1))", "SELECT " + fields.get(j) + " FROM " + from + order + " LIMIT 1 OFFSET " + rowNum, (k + 1));
-                                    callList.add(new BlindSqlDumpCharCallable(vector, payload, charQuery, providerInfo, k));
+                                    callList.add(new BlindSqlDumpCharCallable(this, vector, payload, charQuery, providerInfo, k));
                                 }
 
                                 if (callList.size() > 0) {
                                     try {
                                         logInf("Queuing " + callList.size() + " thread(s) for blind char retrieval");
-                                        // invokeAll() should block until all are complete, or timeout after 15 mins
-                                        List<Future<BlindSqlDumpCharCallable>> futures = executor.invokeAll(callList, 30, TimeUnit.MINUTES);
+                                        // invokeAll() should block until all are complete, or timeout
+                                        List<Future<BlindSqlDumpCharCallable>> futures = executor.invokeAll(callList, EXECUTOR_THREAD_TIMEOUT_MINS, TimeUnit.MINUTES);
 
                                         HashMap<Integer, Character> charMap = new HashMap<>();
 
@@ -2385,6 +2453,8 @@ public class CPMap {
                                         }
                                     } catch (InterruptedException ie) {
                                         logErr("InterruptedException: " + ie.getMessage());
+                                    } finally {
+                                        executor.shutdown();
                                     }
                                 }
                             }
@@ -2408,14 +2478,14 @@ public class CPMap {
             List<BlindSqlDumpCharCallable> callList = new ArrayList<>();
             for (int j = 0; j < rowLen; j++) {
                 String charQuery = String.format(Locale.UK, "SELECT unicode(substr((%s), %d, 1))", dumpSql, (j + 1));
-                callList.add(new BlindSqlDumpCharCallable(vector, payload, charQuery, providerInfo, j));
+                callList.add(new BlindSqlDumpCharCallable(this, vector, payload, charQuery, providerInfo, j));
             }
 
             if (callList.size() > 0) {
                 try {
                     logInf("Queuing " + callList.size() + " thread(s) for blind char retrieval");
-                    // invokeAll() should block until all are complete, or timeout after 15 mins
-                    List<Future<BlindSqlDumpCharCallable>> futures = executor.invokeAll(callList, 30, TimeUnit.MINUTES);
+                    // invokeAll() should block until all are complete, or timeout
+                    List<Future<BlindSqlDumpCharCallable>> futures = executor.invokeAll(callList, EXECUTOR_THREAD_TIMEOUT_MINS, TimeUnit.MINUTES);
 
                     HashMap<Integer, Character> charMap = new HashMap<>();
 
@@ -2444,6 +2514,8 @@ public class CPMap {
                     }
                 } catch (InterruptedException ie) {
                     logErr("InterruptedException: " + ie.getMessage());
+                } finally {
+                    executor.shutdown();
                 }
             }
 
@@ -2481,46 +2553,13 @@ public class CPMap {
             logInf("Modifying query to use concatenation: " + sql);
         }
 
-        // Init ThreadPoolExecutor for the callables
-        BlockingQueue<Runnable> blockingQueue = new ArrayBlockingQueue<>(50);
-        ThreadPoolExecutor executor = new ThreadPoolExecutor(5, 5, 1000, TimeUnit.MILLISECONDS, blockingQueue, new ThreadPoolExecutor.CallerRunsPolicy());
-
-        List<BlindSqlDumpRowCallable> callList = new ArrayList<>();
         for (int i = 0; i < numRows; i++) {
-            callList.add(new BlindSqlDumpRowCallable(vector, payload, sql, providerInfo, i));
-        }
-
-        if (callList.size() > 0) {
-            try {
-                logInf("Queuing " + callList.size() + " thread(s) for blind row retrieval");
-                // invokeAll() should block until all are complete, or timeout after 15 mins
-                List<Future<BlindSqlDumpRowCallable>> futures = executor.invokeAll(callList, 30, TimeUnit.MINUTES);
-
-                HashMap<Integer, String[]> rowMap = new HashMap<>();
-
-                // Threads have finished
-                logInf("Row retrieval threads have finished");
-                for (Future<BlindSqlDumpRowCallable> future : futures) {
-                    try {
-                        BlindSqlDumpRowCallable res = future.get();
-                        if (res != null) {
-                            rowMap.put(res.rowIndex, res.row);
-                        }
-                    } catch (ExecutionException ee) {
-                        logErr("ExecutionException: " + ee.getMessage());
-                    } catch (CancellationException ce) {
-                        logErr("CancellationException: " + ce.getMessage());
-                    }
-                }
-
-                // Add the ordered rows, ignoring null rows
-                for (int i = 0; i < rowMap.size(); i++) {
-                    if (rowMap.containsKey(i) && rowMap.get(i) != null) {
-                        rows.add(rowMap.get(i));
-                    }
-                }
-            } catch (InterruptedException ie) {
-                logErr("InterruptedException: " + ie.getMessage());
+            logInf(String.format(Locale.getDefault(), "Dumping row %d of %d..", i+1, numRows));
+            String[] row = getBlindRow(vector, payload, sql, providerInfo, i);
+            if (row == null) {
+                logWarn("Null row returned for index: " + i);
+            } else {
+                rows.add(row);
             }
         }
 
@@ -2857,7 +2896,10 @@ public class CPMap {
                 "unrecognized token",
                 "Unknown URI",
                 "string or blob too big",
-                "Unrecognized URI"
+                "Unrecognized URI",
+                "incomplete input",
+                "Cannot perform this operation because the connection pool has been closed",
+                "Permission Denial"
         };
         for (String ignoreMsg : ignoreMsgs) {
             if (exMessage.contains(ignoreMsg)) {
@@ -2866,13 +2908,7 @@ public class CPMap {
         }
         String msg = String.format("Unexpected error: %s. Vector: %s. Payload: %s", exMessage, vector, payload);
         logErr(msg);
-        //ex.printStackTrace();
-        if (errorLogWriter != null) {
-            errorLogWriter.write(msg + "\n");
-            PrintWriter printWriter = new PrintWriter(errorLogWriter);
-            ex.printStackTrace(printWriter);
-            errorLogWriter.println("\n");
-        }
+        ex.printStackTrace();
     }
 
     private QueryResult getBaselineQuery(CPVector vector, BooleanBlindPayload payload, ProviderInfo pInfo) {
@@ -2966,13 +3002,18 @@ public class CPMap {
 
         Uri insUri = null;
         if (hasProviderOrPathPermission(pInfo, false, boolBuilder.getVector().getUri())) {
-            res = canUpdateVectorWithPayload(boolBuilder.getVector(), boolBuilder.build());
+            res = canUpdateVectorWithPayload(boolBuilder);
             if (res == -1) {
                 // Cant update the original vector Uri, try getting one via insert
                 ContentValues vals = CPVector.getBasicContentValuesForUpdateVector();
-                if ((insUri = getInsertUri(boolBuilder.getVector(), vals)) != null && (res = canUpdateVectorWithPayload(boolBuilder.getVector().copy(insUri), boolBuilder.build())) != -1) {
-                    // Can acquire and update a newly obtained insert uri so use that
-                    boolBuilder.setVector(boolBuilder.getVector().copy(insUri));
+                insUri = getInsertUri(boolBuilder.getVector(), vals);
+                if (insUri != null) {
+                    BooleanBlindPayload.Builder tmpBuilder = new BooleanBlindPayload.Builder(boolBuilder.build(), boolBuilder.getVector().copy(insUri));
+                    res = canUpdateVectorWithPayload(tmpBuilder);
+                    if (res > -1) {
+                        // Can acquire and update a newly obtained insert uri so use that
+                        boolBuilder.setVector(tmpBuilder.getVector());
+                    }
                 }
             }
 
@@ -3070,10 +3111,63 @@ public class CPMap {
         return false;
     }
 
+    public InputStream getInputStreamForUri(Uri uri) throws FileNotFoundException, SecurityException {
+        InputStream tempIs = null;
+        ContentProviderClient unstableClient = null;
+        RemoteException remoteException = null;
+        try {
+            if (!USE_UNSTABLE_CONTENT_PROVIDER_CLIENT) {
+                tempIs = getResolver(uri).openInputStream(uri);
+            } else {
+                unstableClient = getResolver(uri).acquireUnstableContentProviderClient(uri);
+                ParcelFileDescriptor pfd = unstableClient.openFile(uri, "r");
+                if (pfd != null) {
+                    tempIs = new FileInputStream(pfd.getFileDescriptor());
+                }
+            }
+        } catch (RemoteException re) {
+            logWarn("RemoteException getting input stream for uri " + uri.toString() + ": " + re.getMessage());
+            remoteException = re;
+        } finally {
+            if (unstableClient != null) {
+                unstableClient.close();
+                unstableClient = null;
+                if (remoteException instanceof DeadObjectException) {
+                    handleDeadObjectException(uri);
+                }
+            }
+        }
+        return tempIs;
+    }
+
+    private void handleDeadObjectException(Uri uri) {
+        String deadUriAuth = Util.getAuthorityFromUri(uri);
+        // Count each time a dead object is returned for the uri authority. After 10 times, add the authority to the invalid list
+        if (!deadUriAuthCount.containsKey(deadUriAuth)) {
+            deadUriAuthCount.put(deadUriAuth, 1);
+        } else {
+            deadUriAuthCount.put(deadUriAuth, deadUriAuthCount.get(deadUriAuth) + 1);
+        }
+        // Try waiting
+        logWarn("DeadObjectException - Sleeping current thread for 500ms..");
+        if (deadUriAuthCount.get(deadUriAuth) > 10) {
+            logWarn("Authority (" + deadUriAuth + ") returned a dead object 10+ times, adding to invalid authority list");
+            invalidAuthorities.add(deadUriAuth);
+        }
+        try {
+            Thread.sleep(500);
+        } catch (InterruptedException ie) {}
+    }
+
     private TestResult testPathTraversal(CPVector vector, PathTraversalPayload payload) {
 
         // Only test URI vectors that do not end in a slash (taking the injection placeholder into account)
         if (vector.getType() != CPVector.URI_ID || (vector.getUri().getPath() != null && vector.getUri().getPath().replace(CPVector.injectionChar, "").endsWith("/"))) {
+            return new TestResult(vector, payload, false);
+        }
+
+        ProviderInfo providerInfo = getProviderInfo(vector.getUri().getAuthority());
+        if (providerInfo == null) {
             return new TestResult(vector, payload, false);
         }
 
@@ -3092,7 +3186,12 @@ public class CPMap {
         while (travBuilder.build().getNumTrav() <= TRAVERSAL_PATH_LIMIT && !foundTraversal && !hasFatalErr) {
             try {
                 testVector = travBuilder.getRenderedVector();
-                tempIs = context.getContentResolver().openInputStream(testVector.getUri());
+                tempIs = getInputStreamForUri(testVector.getUri());
+                if (tempIs == null) {
+                    // If we cant acquire an input stream for the URI skip it (prob a bad URI or dead provider)
+                    travBuilder.addNumTrav();
+                    continue;
+                }
                 if (validatePathTraversalInputStream(tempIs, payload)) {
                     foundTraversal = true;
                 }
@@ -3122,7 +3221,7 @@ public class CPMap {
         // If nothing found, and at least one path segment exists in the uri, traverse the path backwards and recurse
         Uri subUri = getSubPathUri(vector.getUri());
         if (!foundTraversal && !Util.compareUriPaths(vector.getUri(), subUri) && shouldTraversePath(vector.copy(subUri))) {
-            vector.setUri(subUri);
+            vector.updateUri(providerInfo, subUri);
             // Reset payload to 0 traversals
             travBuilder.setNumTrav(0);
             return testPathTraversal(vector, travBuilder.build());
@@ -3219,8 +3318,25 @@ public class CPMap {
                 query = matcher.group(1).replace(plString, "<injection>").trim();
             }
 
-            if (query != null && query.trim().endsWith(")")) {
-                query = query.trim().substring(0, query.length() - 1);
+            if (query != null && query.endsWith(")")) {
+                Pattern lbPattern = Pattern.compile("\\(");
+                Pattern rbPattern = Pattern.compile("\\)");
+                Matcher lbMatcher = lbPattern.matcher(query);
+                Matcher rbMatcher = rbPattern.matcher(query);
+
+                int lbCount = 0;
+                while (lbMatcher.find()) {
+                    lbCount++;
+                }
+                int rbCount = 0;
+                while (rbMatcher.find()) {
+                    rbCount++;
+                }
+
+                // If there are more right brackets than left, strip the last right bracket
+                if (rbCount > lbCount) {
+                    query = query.substring(0, query.length() - 1);
+                }
             }
         }
         return query;
@@ -3237,35 +3353,38 @@ public class CPMap {
 
         // Use a simple boolean blind CASE/zeroblob payload that should trigger in most cirmcumstances(?)
         String customCaseBody = "CASE WHEN ([ICOND]) THEN zeroblob(999) ELSE zeroblob(99999999999999) END";
-        BooleanBlindPayload booleanBlindPayload = BooleanBlindPayload.Payloads.get(
+        Set<BooleanBlindPayload> booleanBlindPayloads = BooleanBlindPayload.Payloads.get(
                 new String[] {InjectionPayload.getDefaultField()},
-                0,
-                new char[] {0},
+                BooleanBlindPayload.DEFAULT_BRACKET_LIMIT,
+                new char[] {0, '\'', '"'},
                 new String[] {"AND"},
                 new boolean[] {true},
-                new String[] {customCaseBody}).iterator().next();
+                new String[] {customCaseBody});
 
-        // Check the vector is supported by the payload
-        if (!booleanBlindPayload.isSupportedVector(vector)) {
-            return new HashSet<>();
-        }
+        for (BooleanBlindPayload booleanBlindPayload : booleanBlindPayloads) {
+            // Check the vector is supported by the payload
+            if (!booleanBlindPayload.isSupportedVector(vector)) {
+                continue;
+            }
 
-        BooleanBlindPayload.Builder boolBuilder = new BooleanBlindPayload.Builder(booleanBlindPayload, vector);
+            BooleanBlindPayload.Builder boolBuilder = new BooleanBlindPayload.Builder(booleanBlindPayload, vector);
 
-        // Force the read/write test as there are no query strings to go on
-        QueryResult blindRes = testBooleanBlindQuery(boolBuilder.getVector(), boolBuilder.build(), pInfo);
-        if (blindRes.getStatus() && !blindRes.getCursorMeta().isNull()) {
-            blindRes.getVector().setProviderProperties(pInfo);
-            HashSet<String> colNames = new HashSet<>();
-            Collections.addAll(colNames, blindRes.getCursorMeta().getCols());
-            blindRes.getVector().setReadQueryFields(colNames);
-            blindResList.add(blindRes);
-        }
-        UpdateResult blindUpdRes = testBooleanBlindUpdate(boolBuilder.getVector(), boolBuilder.build(), pInfo);
-        if (blindUpdRes.getStatus()) {
-            blindUpdRes.getVector().setProviderProperties(pInfo);
-            blindUpdRes.getVector().setUpdateQueryFields(new HashSet<>(blindUpdRes.getVector().getValues().keySet()));
-            blindResList.add(blindUpdRes);
+            // Force the read/write test as there are no query strings to go on
+            QueryResult blindRes = testBooleanBlindQuery(boolBuilder.getVector(), boolBuilder.build(), pInfo);
+            if (blindRes.getStatus() && !blindRes.getCursorMeta().isNull()) {
+                HashSet<String> colNames = new HashSet<>();
+                Collections.addAll(colNames, blindRes.getCursorMeta().getCols());
+                blindRes.getVector().setQueryFields(colNames);
+                blindResList.add(blindRes);
+            }
+            UpdateResult blindUpdRes = testBooleanBlindUpdate(boolBuilder.getVector(), boolBuilder.build(), pInfo);
+            if (blindUpdRes.getStatus()) {
+                // Ensure ContentValues are set for the update vector
+                if (blindUpdRes.getVector().getValues() == null || blindUpdRes.getVector().getValues().size() == 0) {
+                    blindUpdRes.getVector().setValues(CPVector.getBasicContentValuesForUpdateVector());
+                }
+                blindResList.add(blindUpdRes);
+            }
         }
 
         return blindResList;
@@ -3284,20 +3403,30 @@ public class CPMap {
         if (payloads != null) {
             for (HeuristicPayload base : payloads) {
                 String query;
-                HeuristicPayload.Builder builder = new HeuristicPayload.Builder(base, vector);
                 Cursor heurCur = null;
                 int heurRes = -1;
-                CPVector testVector = builder.getRenderedVector();
+                HeuristicPayload.Builder builder;
+
+                builder = new HeuristicPayload.Builder(base, vector);
+                CPVector testReadVector = builder.getRenderedVector();
                 if (hasProviderOrPathPermission(pInfo, true, builder.getVector().getUri())) {
                     try {
-                        heurCur = query(testVector.getUri(), testVector.getProjection(), testVector.getWhere(), testVector.getSelectionArgs(), testVector.getSortOrder());
+                        heurCur = query(testReadVector.getUri(), testReadVector.getProjection(), testReadVector.getWhere(), testReadVector.getSelectionArgs(), testReadVector.getSortOrder());
                     } catch (Exception e) {
                         query = getHeuristicQuery(e.getMessage(), builder.build().getPayload());
                         if (query != null) {
-                            // Save a copy of the vector and set provider properties (only once)
-                            builder.getVector().setQuery(query);
-                            builder.getVector().setProviderProperties(pInfo);
-                            heurResList.add(new QueryResult(heurCur, builder.getVector(), builder.build()));
+                            QueryResult result = new QueryResult(heurCur, builder.getVector(), builder.build());
+                            result.getVector().setQuery(query);
+                            // Ensure the result type is as expected, after setting the query string in the vector
+                            if (result.getVector().isQuery()) {
+                                // Explicitly add the query fields based on the CursorMeta object
+                                if (result.getCursorMeta() != null && result.getCursorMeta().getCols().length > 0) {
+                                    HashSet<String> queryFields = new HashSet<>();
+                                    queryFields.addAll(Arrays.asList(result.getCursorMeta().getCols()));
+                                    result.getVector().setQueryFields(queryFields);
+                                }
+                                heurResList.add(result);
+                            }
                         }
                     } finally {
                         if (heurCur != null) {
@@ -3306,16 +3435,24 @@ public class CPMap {
                     }
                 }
 
+                builder = new HeuristicPayload.Builder(base, vector);
+                CPVector testUpdateVector = builder.getRenderedVector();
                 if (hasProviderOrPathPermission(pInfo, false, builder.getVector().getUri())) {
                     try {
-                        heurRes = update(testVector.getUri(), testVector.getValues(), testVector.getWhere(), testVector.getSelectionArgs());
+                        heurRes = update(testUpdateVector.getUri(), testUpdateVector.getValues(), testUpdateVector.getWhere(), testUpdateVector.getSelectionArgs());
                     } catch (Exception e) {
                         query = getHeuristicQuery(e.getMessage(), builder.build().getPayload());
                         if (query != null) {
-                            // Save a copy of the vector and set provider properties (only once)
-                            builder.getVector().setQuery(query);
-                            builder.getVector().setProviderProperties(pInfo);
-                            heurResList.add(new UpdateResult(heurRes, builder.getVector(), builder.build()));
+                            UpdateResult result = new UpdateResult(heurRes, builder.getVector(), builder.build());
+                            result.getVector().setQuery(query);
+                            // Ensure the result type is as expected, after setting the query string in the vector
+                            if (result.getVector().isUpdate()) {
+                                // Ensure ContentValues are set for the update vector
+                                if (result.getVector().getValues() == null || result.getVector().getValues().size() == 0) {
+                                    result.getVector().setValues(CPVector.getBasicContentValuesForUpdateVector());
+                                }
+                                heurResList.add(result);
+                            }
                         }
                     }
                 }
@@ -3461,14 +3598,17 @@ public class CPMap {
         return wordList;
     }
 
-    private Set<Uri> spiderFoundUris(Map<Uri, String[]> foundUris, Set<String> wordList, ThreadPoolExecutor execSvc) {
+    private Set<Uri> spiderFoundUris(Map<Uri, String[]> foundUris, Set<String> appWordList, Set<String> wordList) {
 
         Set<Uri> spiderFoundPaths = new HashSet<>();
         int maxDepth = getMaxDepth();
         int currentDepth = 1;
 
-        // Limit the wordlist to 1000
+        // Get 1000 at random for the spider thread wordlist
         wordList = Util.getRandomSet(wordList, 1000);
+        // Always include the original app word list
+        wordList.addAll(appWordList);
+
         Set<Uri> foundUriList = new HashSet<>(foundUris.keySet());
 
         while (maxDepth > currentDepth) {
@@ -3487,14 +3627,16 @@ public class CPMap {
                     continue;
                 }
 
-                callList.add(new ProviderBruteForceCallable(baseUri, wordList, pInfo));
+                callList.add(new ProviderBruteForceCallable(this, baseUri, wordList, pInfo));
             }
 
             if (callList.size() > 0) {
+                ThreadPoolExecutor executor = getThreadPool();
+
                 try {
                     logInf("Queuing " + callList.size() + " thread(s) for brute forcing");
-                    // invokeAll() should block until all are complete, or timeout after 15 mins
-                    List<Future<List<Uri>>> futures = execSvc.invokeAll(callList, 15, TimeUnit.MINUTES);
+                    // invokeAll() should block until all are complete, or timeout
+                    List<Future<List<Uri>>> futures = executor.invokeAll(callList, EXECUTOR_THREAD_TIMEOUT_MINS, TimeUnit.MINUTES);
 
                     // Threads have finished
                     logInf("Brute force threads have finished");
@@ -3513,6 +3655,8 @@ public class CPMap {
 
                 } catch (InterruptedException ie) {
                     logErr("InterruptedException: " + ie.getMessage());
+                } finally {
+                    executor.shutdown();
                 }
             }
 
@@ -3585,7 +3729,7 @@ public class CPMap {
         try {
             PathTraversalPayload.Builder travBuilder = new PathTraversalPayload.Builder((PathTraversalPayload) travVectorPayload.getPayload(), travVectorPayload.getVector());
             travBuilder.setTargetPath(src);
-            travIs = context.getContentResolver().openInputStream(travBuilder.getRenderedVector().getUri());
+            travIs = getInputStreamForUri(travBuilder.getRenderedVector().getUri());
             if (travIs != null) {
                 // copyFile() closes the stream
                 return Util.copyFile(travIs, dst);
@@ -3643,13 +3787,18 @@ public class CPMap {
                     }
                 }
             }
+        }
 
-            // If no paths were matched at this point, undefined for the uri
-            if (uriPathMatch == 0) {
-                status = -1;
+        if (providerInfo.uriPermissionPatterns != null) {
+            for (PatternMatcher uriMatcher : providerInfo.uriPermissionPatterns) {
+                if (uriMatcher.match(uri.getPath())) {
+                    uriPathMatch++;
+                }
             }
-        } else {
-            // Undefined
+        }
+
+        // If no paths were matched at this point, undefined for the uri
+        if (uriPathMatch == 0) {
             status = -1;
         }
 
@@ -3835,8 +3984,18 @@ public class CPMap {
         return strings;
     }
 
-    private ContentResolver getResolver() {
-        return context.getContentResolver();
+    private ContentResolver getResolver(Uri uri) {
+        ContentResolver resolver = context.getContentResolver();
+        if (uri != null) {
+            try {
+                resolver.takePersistableUriPermission(uri, Intent.FLAG_GRANT_READ_URI_PERMISSION|Intent.FLAG_GRANT_WRITE_URI_PERMISSION);
+            } catch (SecurityException se) {
+                // NOP
+            } catch (Exception e) {
+                logErr("Exception requesting granted perms for Uri (" + uri.toString() + "): " + e.getMessage());
+            }
+        }
+        return resolver;
     }
 
     public Cursor queryWithPayload(CPVector vector, String payloadString) {
@@ -3866,10 +4025,36 @@ public class CPMap {
     }
 
     private Cursor query(Uri uri, String[] projection, String selection, String[] selectionArgs, String sortOrder) {
+        // Return if the URI has been marked as invalid
+        if (invalidAuthorities.contains(Util.getAuthorityFromUri(uri))) {
+            return null;
+        }
+        // Return if the operation is not allowed
+        if (getArrayListOption("operations") != null && !getArrayListOption("operations").contains("QUERY")) {
+            return null;
+        }
         if (queryListener != null) {
             queryListener.onQuery(uri, projection, selection, selectionArgs, sortOrder);
         }
-        return getResolver().query(uri, projection, selection, selectionArgs, sortOrder);
+        if (!USE_UNSTABLE_CONTENT_PROVIDER_CLIENT) {
+            return getResolver(uri).query(uri, projection, selection, selectionArgs, sortOrder);
+        } else {
+            RemoteException remoteException = null;
+            ContentProviderClient unstableClient = getResolver(uri).acquireUnstableContentProviderClient(uri);
+            try {
+                return unstableClient.query(uri, projection, selection, selectionArgs, sortOrder);
+            } catch (RemoteException re) {
+                logWarn("RemoteException from provider: " + re.getMessage());
+                remoteException = re;
+            } finally {
+                unstableClient.close();
+                unstableClient = null;
+                if (remoteException instanceof DeadObjectException) {
+                    handleDeadObjectException(uri);
+                }
+            }
+            return null;
+        }
     }
 
     public Uri insertWithPayload(CPVector vector, String payloadString) {
@@ -3897,10 +4082,36 @@ public class CPMap {
     }
 
     private Uri insert(Uri uri, ContentValues values) {
+        // Return if the URI has been marked as invalid
+        if (invalidAuthorities.contains(Util.getAuthorityFromUri(uri))) {
+            return null;
+        }
+        // Return if the operation is not allowed
+        if (getArrayListOption("operations") != null && !getArrayListOption("operations").contains("INSERT")) {
+            return null;
+        }
         if (queryListener != null) {
             queryListener.onInsert(uri, values);
         }
-        return getResolver().insert(uri, values);
+        if (!USE_UNSTABLE_CONTENT_PROVIDER_CLIENT) {
+            return getResolver(uri).insert(uri, values);
+        } else {
+            RemoteException remoteException = null;
+            ContentProviderClient unstableClient = getResolver(uri).acquireUnstableContentProviderClient(uri);
+            try {
+                return unstableClient.insert(uri, values);
+            } catch (RemoteException re) {
+                logWarn("RemoteException from provider: " + re.getMessage());
+                remoteException = re;
+            } finally {
+                unstableClient.close();
+                unstableClient = null;
+                if (remoteException instanceof DeadObjectException) {
+                    handleDeadObjectException(uri);
+                }
+            }
+            return null;
+        }
     }
 
     public int updateWithPayload(CPVector vector, String payloadString) {
@@ -3928,10 +4139,36 @@ public class CPMap {
     }
 
     private int update(Uri uri, ContentValues values, String where, String[] selectionArgs) {
+        // Return if the URI has been marked as invalid
+        if (invalidAuthorities.contains(Util.getAuthorityFromUri(uri))) {
+            return -1;
+        }
+        // Return if the operation is not allowed
+        if (getArrayListOption("operations") != null && !getArrayListOption("operations").contains("UPDATE")) {
+            return -1;
+        }
         if (queryListener != null) {
             queryListener.onUpdate(uri, values, where, selectionArgs);
         }
-        return getResolver().update(uri, values != null ? values : CPVector.getBasicContentValuesForUpdateVector(), where, selectionArgs);
+        if (!USE_UNSTABLE_CONTENT_PROVIDER_CLIENT) {
+            return getResolver(uri).update(uri, values != null ? values : CPVector.getBasicContentValuesForUpdateVector(), where, selectionArgs);
+        } else {
+            RemoteException remoteException = null;
+            ContentProviderClient unstableClient = getResolver(uri).acquireUnstableContentProviderClient(uri);
+            try {
+                return unstableClient.update(uri, values != null ? values : CPVector.getBasicContentValuesForUpdateVector(), where, selectionArgs);
+            } catch (RemoteException re) {
+                logWarn("RemoteException from provider: " + re.getMessage());
+                remoteException = re;
+            } finally {
+                unstableClient.close();
+                unstableClient = null;
+                if (remoteException instanceof DeadObjectException) {
+                    handleDeadObjectException(uri);
+                }
+            }
+            return -1;
+        }
     }
 
     public int deleteWithPayload(CPVector vector, String payloadString) {
@@ -3959,10 +4196,36 @@ public class CPMap {
     }
 
     private int delete(Uri uri, String where, String[] selectionArgs) {
+        // Return if the URI has been marked as invalid
+        if (invalidAuthorities.contains(Util.getAuthorityFromUri(uri))) {
+            return -1;
+        }
+        // Return if the operation is not allowed
+        if (getArrayListOption("operations") != null && !getArrayListOption("operations").contains("DELETE")) {
+            return -1;
+        }
         if (queryListener != null) {
             queryListener.onDelete(uri, where, selectionArgs);
         }
-        return getResolver().delete(uri, where, selectionArgs);
+        if (!USE_UNSTABLE_CONTENT_PROVIDER_CLIENT) {
+            return getResolver(uri).delete(uri, where, selectionArgs);
+        } else {
+            RemoteException remoteException = null;
+            ContentProviderClient unstableClient = getResolver(uri).acquireUnstableContentProviderClient(uri);
+            try {
+                return unstableClient.delete(uri, where, selectionArgs);
+            } catch (RemoteException re) {
+                logWarn("RemoteException from provider: " + re.getMessage());
+                remoteException = re;
+            } finally {
+                unstableClient.close();
+                unstableClient = null;
+                if (remoteException instanceof DeadObjectException) {
+                    handleDeadObjectException(uri);
+                }
+            }
+            return -1;
+        }
     }
 
     private String getTag() {

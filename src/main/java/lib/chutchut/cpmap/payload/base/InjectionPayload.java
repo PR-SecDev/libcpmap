@@ -8,6 +8,7 @@ import android.content.ContentValues;
 
 import java.util.ArrayList;
 import java.util.Arrays;
+import java.util.Locale;
 
 import lib.chutchut.cpmap.payload.HeuristicPayload;
 import lib.chutchut.cpmap.payload.UnionPayload;
@@ -141,7 +142,7 @@ public abstract class InjectionPayload extends Payload implements Payload.IPaylo
         }
 
         public void addPlaceholderCondition() {
-            addCondition("'XXX'", "?");
+            addCondition(String.valueOf(Util.getRandomIntInRange(1111111, 9999999)), "?");
         }
 
         public void addCondition(String left, String right) {
@@ -321,18 +322,19 @@ public abstract class InjectionPayload extends Payload implements Payload.IPaylo
         if (isLogicalExpression(renderField())) {
             return null;
         }
+        int randInt = Util.getRandomIntInRange(1111111, 9999999);
         // Quote the condition if quote char is set
         if (quoteChar == null) {
             if (bool) {
-                return " != -123";
+                return " != -" + randInt;
             } else {
-                return " = -123";
+                return " = -" + randInt;
             }
         }
         if (bool) {
-            return String.format("%s != -123", quoteChar);
+            return String.format(Locale.getDefault(), "%s != -%d", quoteChar, randInt);
         } else {
-            return String.format("%s = -123", quoteChar);
+            return String.format(Locale.getDefault(), "%s = -%d", quoteChar, randInt);
         }
     }
 

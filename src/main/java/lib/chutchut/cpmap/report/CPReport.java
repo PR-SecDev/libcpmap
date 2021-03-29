@@ -248,22 +248,16 @@ public class CPReport {
         }
         try {
             for (CPVector vector : report.getVectors()) {
-                boolean definedPathPerms = vector.getRequiredPathPermission() == null
-                        || (vector.getRequiredPathPermission() != null && !vector.getRequiredPathPermission().equals("n/a"));
                 repString.append("Got vector: " + vector + "\n");
                 if (vector.getProviderClass() != null) {
                     repString.append("Vulnerable provider: " + vector.getProviderClass() + "\n");
                 }
-                if (vector.getRequiredPermission() == null && !definedPathPerms) {
+                if (vector.getProviderPermission() == null && vector.getPathPermission() == null) {
                     repString.append("Permission required: null\n");
-                } else if (definedPathPerms) {
-                    String pathPerm = vector.getRequiredPathPermission();
-                    if (pathPerm == null) {
-                        pathPerm = "null";
-                    }
-                    repString.append("Permission required (path): " + pathPerm + "\n");
-                } else if (vector.getRequiredPermission() != null) {
-                    repString.append("Permission required (provider): " + vector.getRequiredPermission() + "\n");
+                } else if (vector.getPathPermission() != null) {
+                    repString.append("Permission required (path): " + vector.getPathPermission() + "\n");
+                } else if (vector.getProviderPermission() != null) {
+                    repString.append("Permission required (provider): " + vector.getProviderPermission() + "\n");
                 }
                 if (vector.getQuery() != null && vector.getTable() != null) {
                     repString.append("Original query: '" + vector.getQuery() + "' (table: " + vector.getTable() + ")\n");

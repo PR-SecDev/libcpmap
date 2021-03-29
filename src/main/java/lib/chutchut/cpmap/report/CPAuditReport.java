@@ -13,7 +13,7 @@ import lib.chutchut.cpmap.vector.QueryParser;
 
 public class CPAuditReport {
 
-    private HashMap<Integer, HashSet<String>> vectorTables = new HashMap<>();
+    private HashMap<String, HashSet<String>> vectorTables = new HashMap<>();
     private HashMap<String, String> vectorTableSql = new HashMap<>();
 
     /*
@@ -21,30 +21,40 @@ public class CPAuditReport {
      */
     private CPAuditReport() {}
 
-    public CPAuditReport(HashMap<Integer, HashSet<String>> vectorTables, HashMap<String, String> vectorTableSql) {
+    public CPAuditReport(HashMap<String, HashSet<String>> vectorTables) {
+        this.vectorTables = vectorTables;
+    }
+
+    public CPAuditReport(HashMap<String, HashSet<String>> vectorTables, HashMap<String, String> vectorTableSql) {
         this.vectorTables = vectorTables;
         this.vectorTableSql = vectorTableSql;
     }
 
     public void update(CPAuditReport auditReport) {
         if (auditReport != null) {
-            for (int vHash : auditReport.getVectorTables().keySet()) {
-                if (vectorTables.containsKey(vHash)) {
-                    vectorTables.get(vHash).addAll(auditReport.getAccessibleTables(vHash));
+            for (String vKey : auditReport.getVectorTables().keySet()) {
+                if (vectorTables.containsKey(vKey)) {
+                    vectorTables.get(vKey).addAll(auditReport.getAccessibleTables(vKey));
                 } else {
-                    vectorTables.put(vHash, auditReport.getAccessibleTables(vHash));
+                    vectorTables.put(vKey, auditReport.getAccessibleTables(vKey));
+                }
+            }
+
+            if (auditReport.getVectorTableCreateSqlMap() != null && auditReport.getVectorTableCreateSqlMap().size() > 0) {
+                for (String key : auditReport.getVectorTableCreateSqlMap().keySet()) {
+                    vectorTableSql.put(key, auditReport.getVectorTableCreateSqlMap().get(key));
                 }
             }
         }
     }
 
-    public HashMap<Integer, HashSet<String>> getVectorTables() {
+    public HashMap<String, HashSet<String>> getVectorTables() {
         return vectorTables;
     }
 
-    public HashSet<String> getAccessibleTables(int vHash) {
-        if (vectorTables.containsKey(vHash)) {
-            return vectorTables.get(vHash);
+    public HashSet<String> getAccessibleTables(String vKey) {
+        if (vectorTables.containsKey(vKey)) {
+            return vectorTables.get(vKey);
         }
         return null;
     }
@@ -61,18 +71,37 @@ public class CPAuditReport {
         return allTables;
     }
 
-    public static int getVectorKey(CPVector vector) {
-        // Define the vector key as the hashCode() of the vectors uri authority, falling back to the hashCode() of the vector in
-        // the case of null authorities (unlikely?)
-        return vector.getUri().getAuthority() != null ? vector.getUri().getAuthority().hashCode() : vector.hashCode();
-    }
-
-    public static String getVectorTableKey(int hash, String table) {
-        return String.format("%s::%s", hash, table);
+    public static String getVectorKey(CPVector vector) {
+        String vectorAuth = vector.getUri().getAuthority() != null ? vector.getUri().getAuthority() : String.valueOf(vector.hashCode());
+        String vectorKey = vector.getTypeString() + "_" + vectorAuth;
+        // Distinguish between query/update vectors
+        if (vector.isQuery()) {
+            vectorKey = "QUERY_" + vectorKey;
+        } else {
+            vectorKey = "UPDATE_" + vectorKey;
+        }
+        return vectorKey;
     }
 
     public static String getVectorTableKey(CPVector vector, String table) {
-        return getVectorTableKey(getVectorKey(vector), table);
+        return String.format("%s::%s", getVectorKey(vector), table);
+    }
+
+    public HashMap<String, String> getVectorTableCreateSqlMap() {
+        return vectorTableSql;
+    }
+
+    public String getVectorTableCreateSql(CPVector vector, String table) {
+        String key = getVectorTableKey(vector, table);
+        if (vectorTableSql.containsKey(key) && vectorTableSql.get(key) != null) {
+            return vectorTableSql.get(key);
+        }
+        return null;
+    }
+
+    public void setVectorTableCreateSql(CPVector vector, String table, String sql) {
+        String key = getVectorTableKey(vector, table);
+        vectorTableSql.put(key, sql);
     }
 
     public ArrayList<String> getVectorTableFields(CPVector vector, String table) {
